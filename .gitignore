@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pyc
+models/
+hf_cache/
+frontend_config.json
