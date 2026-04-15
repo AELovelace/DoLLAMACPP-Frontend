@@ -53,6 +53,7 @@ from PySide6.QtWidgets import (
 APP_NAME = "DoLLAMACPP Frontend"
 CONFIG_PATH = Path("frontend_config.json")
 MODELS_DIR = Path("models")
+LLAMA_CPP_RELEASES_URL = "https://github.com/ggml-org/llama.cpp/releases"
 
 
 @dataclass
@@ -920,11 +921,23 @@ class MainWindow(QMainWindow):
         self.hip_llama_path_input = QLineEdit()
         self.vulkan_llama_path_input = QLineEdit()
         self.cpu_llama_path_input = QLineEdit()
+        self.cuda_runtime_url_input = QLineEdit()
+        self.hip_runtime_url_input = QLineEdit()
+        self.vulkan_runtime_url_input = QLineEdit()
+        self.cpu_runtime_url_input = QLineEdit()
+        self.cuda_runtime_url_input.setPlaceholderText(LLAMA_CPP_RELEASES_URL)
+        self.hip_runtime_url_input.setPlaceholderText(LLAMA_CPP_RELEASES_URL)
+        self.vulkan_runtime_url_input.setPlaceholderText(LLAMA_CPP_RELEASES_URL)
+        self.cpu_runtime_url_input.setPlaceholderText(LLAMA_CPP_RELEASES_URL)
 
         llama_layout.addRow("CUDA", self._build_path_row(self.cuda_llama_path_input, "cuda"))
         llama_layout.addRow("HIP", self._build_path_row(self.hip_llama_path_input, "hip"))
         llama_layout.addRow("Vulkan", self._build_path_row(self.vulkan_llama_path_input, "vulkan"))
         llama_layout.addRow("CPU", self._build_path_row(self.cpu_llama_path_input, "cpu"))
+        llama_layout.addRow("CUDA URL", self.cuda_runtime_url_input)
+        llama_layout.addRow("HIP URL", self.hip_runtime_url_input)
+        llama_layout.addRow("Vulkan URL", self.vulkan_runtime_url_input)
+        llama_layout.addRow("CPU URL", self.cpu_runtime_url_input)
 
         self.detect_paths_button = QPushButton("Auto Detect Paths")
         self.detect_paths_button.clicked.connect(self._auto_fill_llama_paths)
@@ -1433,6 +1446,22 @@ class MainWindow(QMainWindow):
         self.vulkan_llama_path_input.setText(str(llama_paths.get("vulkan", "") or ""))
         self.cpu_llama_path_input.setText(str(llama_paths.get("cpu", "") or ""))
 
+        runtime_binary_urls = data.get("runtime_binary_urls", {})
+        if not isinstance(runtime_binary_urls, dict):
+            runtime_binary_urls = {}
+        self.cuda_runtime_url_input.setText(str(runtime_binary_urls.get("cuda", "") or ""))
+        self.hip_runtime_url_input.setText(str(runtime_binary_urls.get("hip", "") or ""))
+        self.vulkan_runtime_url_input.setText(str(runtime_binary_urls.get("vulkan", "") or ""))
+        self.cpu_runtime_url_input.setText(str(runtime_binary_urls.get("cpu", "") or ""))
+        if not self.cuda_runtime_url_input.text().strip():
+            self.cuda_runtime_url_input.setText(LLAMA_CPP_RELEASES_URL)
+        if not self.hip_runtime_url_input.text().strip():
+            self.hip_runtime_url_input.setText(LLAMA_CPP_RELEASES_URL)
+        if not self.vulkan_runtime_url_input.text().strip():
+            self.vulkan_runtime_url_input.setText(LLAMA_CPP_RELEASES_URL)
+        if not self.cpu_runtime_url_input.text().strip():
+            self.cpu_runtime_url_input.setText(LLAMA_CPP_RELEASES_URL)
+
         chat_target = int(data.get("chat_server", 0) or 0)
         self.chat_server_selector.setCurrentIndex(max(0, min(3, chat_target)))
 
@@ -1512,6 +1541,12 @@ class MainWindow(QMainWindow):
                 "hip": self.hip_llama_path_input.text().strip(),
                 "vulkan": self.vulkan_llama_path_input.text().strip(),
                 "cpu": self.cpu_llama_path_input.text().strip(),
+            },
+            "runtime_binary_urls": {
+                "cuda": self.cuda_runtime_url_input.text().strip(),
+                "hip": self.hip_runtime_url_input.text().strip(),
+                "vulkan": self.vulkan_runtime_url_input.text().strip(),
+                "cpu": self.cpu_runtime_url_input.text().strip(),
             },
             "chat_server": self.chat_server_selector.currentIndex(),
             "servers": servers,
@@ -1915,7 +1950,62 @@ class MainWindow(QMainWindow):
         if detected:
             self._llama_path_input_for_backend(backend).setText(detected)
             return detected
+
+        fetched = self._fetch_runtime_binary(backend)
+        if fetched:
+            self._llama_path_input_for_backend(backend).setText(fetched)
+            self._save_config()
+            return fetched
         return ""
+
+    def _fetch_runtime_binary(self, backend: str) -> str:
+        workspace = Path(__file__).resolve().parent
+        script_path = workspace / "scripts" / "fetch_runtime_binaries.py"
+        if not script_path.exists():
+            self.log_output.appendPlainText(f"[RUNTIME] fetch script not found: {script_path}")
+            return ""
+
+        self.log_output.appendPlainText(f"[RUNTIME] missing {backend.upper()} runtime, attempting fetch...")
+
+        try:
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(script_path),
+                    "--backend",
+                    backend,
+                    "--workspace",
+                    str(workspace),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=900,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            self.log_output.appendPlainText(f"[RUNTIME] fetch failed: {exc}")
+            return ""
+
+        stdout = (completed.stdout or "").strip()
+        stderr = (completed.stderr or "").strip()
+        if completed.returncode != 0:
+            if stderr:
+                self.log_output.appendPlainText(f"[RUNTIME] {stderr}")
+            else:
+                self.log_output.appendPlainText("[RUNTIME] fetch failed with unknown error.")
+            return ""
+
+        if not stdout:
+            self.log_output.appendPlainText("[RUNTIME] fetch completed but no runtime path was returned.")
+            return ""
+
+        runtime_path = stdout.splitlines()[-1].strip()
+        if not runtime_path or not Path(runtime_path).exists():
+            self.log_output.appendPlainText(f"[RUNTIME] fetch returned invalid path: {runtime_path}")
+            return ""
+
+        self.log_output.appendPlainText(f"[RUNTIME] fetched {backend.upper()} runtime: {runtime_path}")
+        return runtime_path
 
     def _update_backend_label(self, slot: ServerSlot) -> None:
         backend = self._infer_backend(self._selected_devices(slot))

@@ -58,6 +58,7 @@ python app.py
 - Downloaded models go into `models/`.
 - For gated Hugging Face repos, paste a token into the `HF Token` field.
 - In **App Settings**, configure global `llama-server` executables for `CUDA`, `HIP`, `Vulkan`, and `CPU` once (used by all server slots).
+- Runtime URL fields default to `https://github.com/ggml-org/llama.cpp/releases`; missing binaries are auto-fetched from latest release assets.
 - In **Server Settings**, each server slot has independent model path, host/port, context size, extra args, and checkbox-based device assignment.
 - In **Server Settings**, each server slot also has an **Ollama Model** alias used by the compatibility proxy for model routing.
 - For HIP and Vulkan builds, point a server slot to your `hip-llama` or `vulkan-llama` `llama-server` executable (or leave path empty to use simple autodetect paths).
@@ -85,6 +86,15 @@ Device assignment behavior:
 - Select devices per server with checkboxes (CPU and/or detected GPUs).
 - Valid combinations are CPU-only, or one/more GPUs from the same backend.
 - Backend executable is auto-selected from App Settings based on selected devices.
+
+Runtime fetch behavior:
+
+- If a selected backend runtime is missing locally, the app runs `scripts/fetch_runtime_binaries.py` automatically.
+- For Windows, release asset selection prefers these targets from latest ggml release:
+	- CUDA: `win-cuda-12.x`
+	- Vulkan: `win-vulkan-x64`
+	- HIP: `win-hip-radeon-x64`
+	- CPU: `win-cpu-x64`
 
 Typical client setup:
 
