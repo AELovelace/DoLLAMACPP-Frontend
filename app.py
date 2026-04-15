@@ -977,7 +977,8 @@ class MainWindow(QMainWindow):
         tabs = QTabWidget()
         tabs.addTab(self._build_app_settings_tab(), "App Settings")
         tabs.addTab(self._build_hf_tab(), "Hugging Face Search")
-        tabs.addTab(self._build_run_panel(), "Server Settings")
+        tabs.addTab(self._build_global_settings_tab(), "Global Settings")
+        tabs.addTab(self._build_server_slots_tab(), "Server Slots")
         tabs.addTab(self._build_log_panel(), "Server Log")
         tabs.addTab(self._build_chat_panel(), "Chat Tester")
 
@@ -1152,29 +1153,32 @@ class MainWindow(QMainWindow):
     def _build_right_panel(self) -> QWidget:
         container = QWidget()
         layout = QVBoxLayout(container)
-        layout.addWidget(self._build_run_panel())
+        layout.addWidget(self._build_global_settings_tab())
         layout.addWidget(self._build_repo_details_panel())
         return container
 
-    def _build_run_panel(self) -> QWidget:
+    def _build_global_settings_tab(self) -> QWidget:
         container = QWidget()
         layout = QVBoxLayout(container)
 
-        global_box = QGroupBox("Global Server Settings")
-        global_layout = QFormLayout(global_box)
+        hf_box = QGroupBox("Hugging Face")
+        hf_layout = QFormLayout(hf_box)
 
         self.hf_token_input = QLineEdit()
         self.hf_token_input.setPlaceholderText("Optional Hugging Face token for gated/private repos")
         self.hf_token_input.setEchoMode(QLineEdit.Password)
-        global_layout.addRow("HF Token", self.hf_token_input)
+        hf_layout.addRow("HF Token", self.hf_token_input)
 
         self.model_target_server_selector = QComboBox()
         self.model_target_server_selector.addItems([f"Server {index + 1}" for index in range(4)])
-        global_layout.addRow("HF model target", self.model_target_server_selector)
+        hf_layout.addRow("HF model target", self.model_target_server_selector)
+
+        ollama_box = QGroupBox("Ollama Proxy")
+        ollama_layout = QFormLayout(ollama_box)
 
         self.ollama_default_server_selector = QComboBox()
         self.ollama_default_server_selector.addItems([f"Server {index + 1}" for index in range(4)])
-        global_layout.addRow("Ollama default", self.ollama_default_server_selector)
+        ollama_layout.addRow("Default server", self.ollama_default_server_selector)
 
         ollama_proxy_layout = QGridLayout()
         self.ollama_host_input = QLineEdit("127.0.0.1")
@@ -1185,7 +1189,7 @@ class MainWindow(QMainWindow):
         ollama_proxy_layout.addWidget(self.ollama_host_input, 0, 1)
         ollama_proxy_layout.addWidget(QLabel("Base Port"), 0, 2)
         ollama_proxy_layout.addWidget(self.ollama_port_input, 0, 3)
-        global_layout.addRow("Ollama API", self._wrap_layout(ollama_proxy_layout))
+        ollama_layout.addRow("Listen", self._wrap_layout(ollama_proxy_layout))
         self.ollama_host_input.textChanged.connect(self._update_proxy_port_labels)
         self.ollama_port_input.valueChanged.connect(self._update_proxy_port_labels)
 
@@ -1200,12 +1204,15 @@ class MainWindow(QMainWindow):
         ollama_controls.addWidget(self.start_ollama_proxy_button)
         ollama_controls.addWidget(self.stop_ollama_proxy_button)
         ollama_controls.addWidget(self.test_ollama_proxy_button)
-        global_layout.addRow("Proxy Control", self._wrap_layout(ollama_controls))
+        ollama_layout.addRow("Proxy Control", self._wrap_layout(ollama_controls))
 
         self.ollama_proxy_status = QLabel("Ollama API proxy is stopped.")
-        global_layout.addRow("Proxy Status", self.ollama_proxy_status)
+        ollama_layout.addRow("Proxy Status", self.ollama_proxy_status)
         self.ollama_proxy_test_status = QLabel("Proxy test idle.")
-        global_layout.addRow("Proxy Test", self.ollama_proxy_test_status)
+        ollama_layout.addRow("Proxy Test", self.ollama_proxy_test_status)
+
+        chat_box = QGroupBox("Chat Defaults")
+        chat_layout = QFormLayout(chat_box)
 
         generation_layout = QGridLayout()
         self.temperature_input = QSpinBox()
@@ -1218,8 +1225,15 @@ class MainWindow(QMainWindow):
         generation_layout.addWidget(self.temperature_input, 0, 1)
         generation_layout.addWidget(QLabel("Reply Tokens"), 0, 2)
         generation_layout.addWidget(self.chat_max_tokens_input, 0, 3)
-        global_layout.addRow("Chat Defaults", self._wrap_layout(generation_layout))
+        chat_layout.addRow("Defaults", self._wrap_layout(generation_layout))
 
+        layout.addWidget(hf_box)
+        layout.addWidget(ollama_box)
+        layout.addWidget(chat_box)
+        layout.addStretch(1)
+        return container
+
+    def _build_server_slots_tab(self) -> QWidget:
         self.server_slots = []
         slots_wrapper = QWidget()
         slots_layout = QVBoxLayout(slots_wrapper)
@@ -1230,10 +1244,7 @@ class MainWindow(QMainWindow):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(slots_wrapper)
-
-        layout.addWidget(global_box)
-        layout.addWidget(scroll, stretch=1)
-        return container
+        return scroll
 
     def _build_server_slot(self, index: int) -> QWidget:
         box = QGroupBox(f"Server {index + 1}")
