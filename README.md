@@ -5,10 +5,11 @@ A small Python + Qt frontend for:
 - searching Hugging Face model repos
 - listing GGUF files inside a selected repo
 - downloading a selected GGUF model locally
-- launching `llama-server` against that model
+- launching up to 4 `llama-server` instances
+- exposing an Ollama-compatible API proxy for drop-in app integration
 - sending a quick test chat prompt to the running server
 
-## What this first version does
+## What this version does
 
 This starter app now covers the full first workflow:
 
@@ -16,8 +17,11 @@ This starter app now covers the full first workflow:
 2. search Hugging Face for a model repo
 3. inspect repo metadata and available `.gguf` files
 4. download a selected file into the local `models/` folder
-5. launch `llama-server` with that file
-6. send a chat request from inside the app
+5. assign the model file to one of 4 server slots
+6. choose backend per slot (`CUDA`, `HIP`, `Vulkan`, `CPU`)
+7. optionally assign GPU IDs per slot and choose multi-GPU mode (`parallel` or `pooled`)
+8. launch each server independently and send a chat request from inside the app
+9. run an Ollama-compatible proxy on `http://127.0.0.1:11434` and route requests to your server slots
 
 It is meant as a clean foundation we can extend with presets, model management, health checks, and better server controls.
 
@@ -50,12 +54,42 @@ python app.py
 
 ## Notes
 
-- The app stores basic settings in `frontend_config.json`.
+- The app stores server and chat settings in `frontend_config.json`.
 - Downloaded models go into `models/`.
 - For gated Hugging Face repos, paste a token into the `HF Token` field.
+- In **App Settings**, configure global `llama-server` executables for `CUDA`, `HIP`, `Vulkan`, and `CPU` once (used by all server slots).
+- In **Server Settings**, each server slot has independent model path, host/port, context size, extra args, and checkbox-based device assignment.
+- In **Server Settings**, each server slot also has an **Ollama Model** alias used by the compatibility proxy for model routing.
+- For HIP and Vulkan builds, point a server slot to your `hip-llama` or `vulkan-llama` `llama-server` executable (or leave path empty to use simple autodetect paths).
+- Use **Start Ollama Proxy** to expose Ollama-style endpoints on a configurable host/port (default `127.0.0.1:11434`).
 - Model downloads show live transferred bytes, total size when available, and estimated throughput.
 - The repository panel shows basic metadata such as author, tags, downloads, and license when available.
-- The chat panel is a lightweight tester for a running local server, not a full chat client yet.
+- The chat panel is a lightweight tester for any selected server slot, not a full chat client yet.
+
+## Ollama API compatibility
+
+The in-app proxy implements these endpoints:
+
+- `GET /api/tags`
+- `POST /api/show`
+- `POST /api/generate`
+- `POST /api/chat`
+
+Routing behavior:
+
+- `model` (or `name`) is matched to a server slot by that slot's **Ollama Model** alias.
+- If no model is provided or no exact alias matches, requests route to the configured **Ollama default** server.
+
+Device assignment behavior:
+
+- Select devices per server with checkboxes (CPU and/or detected GPUs).
+- Valid combinations are CPU-only, or one/more GPUs from the same backend.
+- Backend executable is auto-selected from App Settings based on selected devices.
+
+Typical client setup:
+
+- Set `OLLAMA_HOST=http://127.0.0.1:11434`
+- Keep using your existing Ollama client library or HTTP calls
 
 ## Good first test
 

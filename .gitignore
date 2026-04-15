@@ -4,3 +4,8 @@ __pycache__/
 models/
 hf_cache/
 frontend_config.json
+cpu-llama/
+cuda-llama/
+hip-llama/
+vulkan-llama/
+llama.cpp/
