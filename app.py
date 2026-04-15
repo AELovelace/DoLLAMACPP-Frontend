@@ -119,6 +119,9 @@ class ServerSlot:
     device_box: QGroupBox
     device_checkboxes: dict[str, QCheckBox]
     split_mode_input: QComboBox
+    cache_type_k_input: QComboBox
+    cache_type_v_input: QComboBox
+    flash_attn_checkbox: QCheckBox
     start_button: QPushButton
     stop_button: QPushButton
     status_label: QLabel
@@ -1275,6 +1278,21 @@ class MainWindow(QMainWindow):
         split_mode_input.addItems(["parallel", "pooled"])
         form.addRow("Multi-GPU Mode", split_mode_input)
 
+        kv_cache_types = ["f16", "q8_0", "q4_0", "q4_1"]
+        cache_type_k_input = QComboBox()
+        cache_type_k_input.addItems(kv_cache_types)
+        cache_type_v_input = QComboBox()
+        cache_type_v_input.addItems(kv_cache_types)
+        kv_row = QHBoxLayout()
+        kv_row.addWidget(QLabel("K:"))
+        kv_row.addWidget(cache_type_k_input)
+        kv_row.addWidget(QLabel("V:"))
+        kv_row.addWidget(cache_type_v_input)
+        form.addRow("KV Cache Type", self._wrap_layout(kv_row))
+
+        flash_attn_checkbox = QCheckBox("Enable (recommended with quantized KV cache)")
+        form.addRow("Flash Attention", flash_attn_checkbox)
+
         network_layout = QGridLayout()
         host_input = QLineEdit("127.0.0.1")
         port_input = QSpinBox()
@@ -1333,6 +1351,9 @@ class MainWindow(QMainWindow):
                 device_box=device_box,
                 device_checkboxes={},
                 split_mode_input=split_mode_input,
+                cache_type_k_input=cache_type_k_input,
+                cache_type_v_input=cache_type_v_input,
+                flash_attn_checkbox=flash_attn_checkbox,
                 start_button=start_button,
                 stop_button=stop_button,
                 status_label=status_label,
@@ -1582,6 +1603,16 @@ class MainWindow(QMainWindow):
             slot.ctx_size_input.setValue(int(server_data.get("ctx_size", 4096) or 4096))
             slot.extra_args_input.setText(str(server_data.get("extra_args", "") or ""))
 
+            cache_k = str(server_data.get("cache_type_k", "f16") or "f16")
+            cache_v = str(server_data.get("cache_type_v", "f16") or "f16")
+            k_idx = slot.cache_type_k_input.findText(cache_k)
+            v_idx = slot.cache_type_v_input.findText(cache_v)
+            if k_idx >= 0:
+                slot.cache_type_k_input.setCurrentIndex(k_idx)
+            if v_idx >= 0:
+                slot.cache_type_v_input.setCurrentIndex(v_idx)
+            slot.flash_attn_checkbox.setChecked(bool(server_data.get("flash_attn", False)))
+
             selected_device_keys = server_data.get("device_keys")
             if isinstance(selected_device_keys, list):
                 normalized_keys = [str(item) for item in selected_device_keys if isinstance(item, str)]
@@ -1613,6 +1644,9 @@ class MainWindow(QMainWindow):
                     "port": slot.port_input.value(),
                     "ctx_size": slot.ctx_size_input.value(),
                     "extra_args": slot.extra_args_input.text().strip(),
+                    "cache_type_k": slot.cache_type_k_input.currentText(),
+                    "cache_type_v": slot.cache_type_v_input.currentText(),
+                    "flash_attn": slot.flash_attn_checkbox.isChecked(),
                     "device_keys": selected_keys,
                     "split_mode": slot.split_mode_input.currentText(),
                 }
@@ -2208,6 +2242,15 @@ class MainWindow(QMainWindow):
         gpu_ids = [device.env_id for device in selected_devices if device.backend == backend and device.env_id]
         if len(gpu_ids) > 1 and slot.split_mode_input.currentText() == "pooled":
             arguments.extend(["--main-gpu", "0", "--tensor-split", ",".join(["1"] * len(gpu_ids))])
+
+        cache_k = slot.cache_type_k_input.currentText()
+        cache_v = slot.cache_type_v_input.currentText()
+        if cache_k != "f16":
+            arguments.extend(["--cache-type-k", cache_k])
+        if cache_v != "f16":
+            arguments.extend(["--cache-type-v", cache_v])
+        if slot.flash_attn_checkbox.isChecked():
+            arguments.append("-fa")
 
         extra_args = slot.extra_args_input.text().strip()
         if extra_args:
