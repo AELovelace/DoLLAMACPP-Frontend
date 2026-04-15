@@ -513,6 +513,16 @@ class OllamaCompatProxy:
         text = choices[0].get("text", "")
         return str(text).strip()
 
+    @staticmethod
+    def _messages_to_prompt(messages: list[dict[str, str]]) -> str:
+        lines: list[str] = []
+        for item in messages:
+            role = str(item.get("role", "user") or "user")
+            content = str(item.get("content", "") or "")
+            lines.append(f"{role}: {content}")
+        lines.append("assistant:")
+        return "\n".join(lines).strip()
+
     def _handle_show(self, handler: BaseHTTPRequestHandler) -> None:
         try:
             payload = self._read_json(handler)
@@ -557,19 +567,66 @@ class OllamaCompatProxy:
     ) -> str:
         upstream_host = normalize_connect_host(str(slot.get("host", "127.0.0.1") or "127.0.0.1"))
         base_url = f"http://{upstream_host}:{int(slot.get('port', 8080))}"
-        response = requests.post(
-            f"{base_url.rstrip('/')}/v1/chat/completions",
+        chat_payload = {
+            "model": "local-model",
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": False,
+        }
+
+        chat_text: str | None = None
+        for attempt in range(3):
+            try:
+                response = requests.post(
+                    f"{base_url.rstrip('/')}/v1/chat/completions",
+                    json=chat_payload,
+                    timeout=300,
+                )
+                response.raise_for_status()
+                chat_text = self._extract_text_from_chat_choice(response.json())
+                if chat_text:
+                    return chat_text
+                # Got 200 but empty content — log and fall through to completions
+                break
+            except requests.HTTPError as exc:
+                status_code = exc.response.status_code if exc.response is not None else 0
+                if status_code in {404, 405, 501}:
+                    break
+                if status_code == 503 and attempt < 2:
+                    time.sleep(1.0)
+                    continue
+                raise
+            except requests.RequestException:
+                if attempt < 2:
+                    time.sleep(1.0)
+                    continue
+                raise
+
+        # Fallback: /v1/completions with messages flattened to a prompt
+        prompt = self._messages_to_prompt(messages)
+        completion_response = requests.post(
+            f"{base_url.rstrip('/')}/v1/completions",
             json={
                 "model": "local-model",
-                "messages": messages,
+                "prompt": prompt,
                 "temperature": temperature,
                 "max_tokens": max_tokens,
                 "stream": False,
             },
             timeout=300,
         )
-        response.raise_for_status()
-        return self._extract_text_from_chat_choice(response.json())
+        completion_response.raise_for_status()
+        text = self._extract_text_from_completion(completion_response.json())
+        if text:
+            return text
+
+        # Both endpoints returned empty — surface as a visible error
+        raise RuntimeError(
+            "Upstream server returned empty content from both /v1/chat/completions and /v1/completions. "
+            "If using a Qwen3 thinking model, try adding '/no_think' at the start of your message, "
+            "or set extra args '--no-reasoning' in the server slot."
+        )
 
     def _forward_completion(
         self,

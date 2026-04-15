@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlparse, urlunparse
 
 import requests
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Qt
@@ -79,6 +79,62 @@ def _extract_content(payload: dict[str, Any]) -> str:
     return str(content).strip()
 
 
+def normalize_base_url(base_url: str) -> str:
+    value = base_url.strip()
+    if not value:
+        return value
+    parsed = urlparse(value)
+    if not parsed.scheme:
+        parsed = urlparse(f"http://{value}")
+
+    hostname = (parsed.hostname or "").strip().lower()
+    if hostname not in {"0.0.0.0", "::", "[::]"}:
+        return urlunparse(parsed).rstrip("/")
+
+    port = parsed.port
+    host = "127.0.0.1"
+    netloc = f"{host}:{port}" if port else host
+    patched = parsed._replace(netloc=netloc)
+    return urlunparse(patched).rstrip("/")
+
+
+def _http_error_details(response: requests.Response) -> str:
+    details = response.text.strip()
+    try:
+        payload = response.json()
+    except Exception:
+        payload = None
+    if isinstance(payload, dict):
+        error_text = payload.get("error")
+        if isinstance(error_text, str) and error_text.strip():
+            details = error_text.strip()
+    return details
+
+
+def fetch_tags(base_url: str, timeout: float) -> list[str]:
+    url = f"{base_url.rstrip('/')}/api/tags"
+    response = requests.get(url, timeout=timeout)
+    if not response.ok:
+        details = _http_error_details(response)
+        summary = f"HTTP {response.status_code} from {url}"
+        if details:
+            summary = f"{summary}: {details}"
+        raise RuntimeError(summary)
+
+    payload = response.json()
+    models = payload.get("models", []) if isinstance(payload, dict) else []
+    if not isinstance(models, list):
+        models = []
+
+    names: list[str] = []
+    for item in models:
+        if isinstance(item, dict):
+            name = str(item.get("name", "") or "").strip()
+            if name:
+                names.append(name)
+    return names
+
+
 def send_chat(
     *,
     base_url: str,
@@ -98,15 +154,7 @@ def send_chat(
     )
 
     if not response.ok:
-        details = response.text.strip()
-        try:
-            payload = response.json()
-            if isinstance(payload, dict):
-                error_text = payload.get("error")
-                if isinstance(error_text, str) and error_text.strip():
-                    details = error_text.strip()
-        except Exception:
-            pass
+        details = _http_error_details(response)
 
         summary = f"HTTP {response.status_code} from {url}"
         if details:
@@ -125,7 +173,13 @@ def send_chat(
     if isinstance(raw, str) and raw.strip():
         return raw.strip()
 
-    return json.dumps(data, ensure_ascii=False)
+    # Both fields empty — surface reason if available
+    done_reason = data.get("done_reason", "")
+    raise RuntimeError(
+        f"Server returned empty content (done_reason={done_reason!r}). "
+        "If using a Qwen3 thinking model, start your message with /no_think to disable chain-of-thought, "
+        "or add '--no-reasoning' in the server slot Extra Args."
+    )
 
 
 class QuickChatWindow(QMainWindow):
@@ -306,7 +360,9 @@ class QuickChatWindow(QMainWindow):
         return timeout
 
     def ping_tags(self) -> None:
-        base_url = self.base_url_input.text().strip()
+        base_url = normalize_base_url(self.base_url_input.text().strip())
+        if base_url != self.base_url_input.text().strip():
+            self.base_url_input.setText(base_url)
         if not base_url:
             QMessageBox.warning(self, "Missing URL", "Set a Base URL first.")
             return
@@ -317,24 +373,19 @@ class QuickChatWindow(QMainWindow):
             return
 
         self._set_busy(True, f"Pinging {base_url.rstrip('/')}/api/tags ...")
-        worker = Worker(self._probe_tags, base_url, timeout)
+        worker = Worker(fetch_tags, base_url, timeout)
         worker.signals.finished.connect(self._ping_complete)
         worker.signals.error.connect(self._ping_failed)
         self.thread_pool.start(worker)
 
-    @staticmethod
-    def _probe_tags(base_url: str, timeout: float) -> dict[str, Any]:
-        response = requests.get(f"{base_url.rstrip('/')}/api/tags", timeout=timeout)
-        response.raise_for_status()
-        payload = response.json()
-        models = payload.get("models", []) if isinstance(payload, dict) else []
-        if not isinstance(models, list):
-            models = []
-        return {"count": len(models)}
-
-    def _ping_complete(self, payload: dict[str, Any]) -> None:
-        count = int(payload.get("count", 0) or 0)
-        self._set_busy(False, f"Connected. /api/tags returned {count} model(s).")
+    def _ping_complete(self, models: list[str]) -> None:
+        count = len(models)
+        if count == 0:
+            self._set_busy(False, "Connected. /api/tags returned 0 models.")
+            return
+        preview = ", ".join(models[:4])
+        suffix = "..." if count > 4 else ""
+        self._set_busy(False, f"Connected. models={count}: {preview}{suffix}")
 
     def _ping_failed(self, message: str) -> None:
         self._set_busy(False, f"Ping failed: {message}")
@@ -344,7 +395,9 @@ class QuickChatWindow(QMainWindow):
         if not text:
             return
 
-        base_url = self.base_url_input.text().strip()
+        base_url = normalize_base_url(self.base_url_input.text().strip())
+        if base_url != self.base_url_input.text().strip():
+            self.base_url_input.setText(base_url)
         model = self.model_input.text().strip()
         if not base_url:
             QMessageBox.warning(self, "Missing URL", "Set a Base URL first.")
@@ -358,9 +411,35 @@ class QuickChatWindow(QMainWindow):
             QMessageBox.warning(self, "Invalid Timeout", str(exc))
             return
 
+        try:
+            available_models = fetch_tags(base_url, timeout)
+        except Exception as exc:  # noqa: BLE001
+            self._append_chat("error", f"Preflight failed: {exc}")
+            self._set_busy(False, "Preflight failed.")
+            return
+
+        if available_models and model not in available_models:
+            preview = ", ".join(available_models[:6])
+            self._append_chat(
+                "error",
+                f"Model '{model}' not in /api/tags. Available: {preview}{'...' if len(available_models) > 6 else ''}",
+            )
+            self._set_busy(False, "Model alias mismatch.")
+            return
+
         self.pending_user_message = text
-        self.messages.append({"role": "user", "content": text})
-        self._append_chat("you", text)
+        messages_to_send = list(self.messages)
+
+        # Qwen3 thinking-mode shorthand: prepend /no_think tag to last user message
+        send_text = text
+        if send_text.lower().startswith("/no_think "):
+            send_text = "/no_think " + send_text[10:]
+        elif send_text.lower() == "/no_think":
+            send_text = "/no_think"
+
+        self.messages.append({"role": "user", "content": send_text})
+        messages_to_send = list(self.messages)
+        self._append_chat("you", send_text)
         self.prompt_input.clear()
         self._set_busy(True, "Waiting for response...")
 
@@ -368,7 +447,7 @@ class QuickChatWindow(QMainWindow):
             send_chat,
             base_url=base_url,
             model=model,
-            messages=list(self.messages),
+            messages=messages_to_send,
             timeout=timeout,
         )
         worker.signals.finished.connect(self._chat_complete)
