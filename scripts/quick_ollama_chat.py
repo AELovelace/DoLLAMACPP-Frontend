@@ -32,6 +32,7 @@ class ChatConfig:
     model: str
     system: str
     timeout: float
+    num_predict: int
 
 
 class WorkerSignals(QObject):
@@ -62,6 +63,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default=os.environ.get("OLLAMA_MODEL", "server-1"))
     parser.add_argument("--system", default="")
     parser.add_argument("--timeout", type=float, default=120.0)
+    parser.add_argument("--num-predict", type=int, default=2048, help="Max tokens to generate (default: 2048).")
     return parser.parse_args()
 
 
@@ -141,6 +143,7 @@ def send_chat(
     model: str,
     messages: list[dict[str, str]],
     timeout: float,
+    num_predict: int = 2048,
 ) -> str:
     url = f"{base_url.rstrip('/')}/api/chat"
     response = requests.post(
@@ -149,6 +152,7 @@ def send_chat(
             "model": model,
             "messages": messages,
             "stream": False,
+            "options": {"num_predict": num_predict},
         },
         timeout=timeout,
     )
@@ -207,7 +211,9 @@ class QuickChatWindow(QMainWindow):
         settings_form.addRow("Base URL", self.base_url_input)
         settings_form.addRow("Model", self.model_input)
         settings_form.addRow("System Prompt", self.system_input)
+        self.num_predict_input = QLineEdit(str(config.num_predict))
         settings_form.addRow("Timeout (s)", self.timeout_input)
+        settings_form.addRow("Max Tokens", self.num_predict_input)
 
         control_row = QHBoxLayout()
         self.ping_button = QPushButton("Ping /api/tags")
@@ -443,12 +449,18 @@ class QuickChatWindow(QMainWindow):
         self.prompt_input.clear()
         self._set_busy(True, "Waiting for response...")
 
+        try:
+            num_predict = int(self.num_predict_input.text().strip() or "2048")
+        except ValueError:
+            num_predict = 2048
+
         worker = Worker(
             send_chat,
             base_url=base_url,
             model=model,
             messages=messages_to_send,
             timeout=timeout,
+            num_predict=num_predict,
         )
         worker.signals.finished.connect(self._chat_complete)
         worker.signals.error.connect(self._chat_failed)
@@ -477,6 +489,7 @@ def main() -> int:
             model=args.model,
             system=args.system,
             timeout=args.timeout,
+            num_predict=args.num_predict,
         )
     )
     window.show()

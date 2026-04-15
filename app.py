@@ -125,6 +125,7 @@ class ServerSlot:
     cache_type_k_input: QComboBox
     cache_type_v_input: QComboBox
     flash_attn_checkbox: QCheckBox
+    no_cache_prompt_checkbox: QCheckBox
     auto_start_checkbox: QCheckBox
     start_button: QPushButton
     stop_button: QPushButton
@@ -695,8 +696,10 @@ class OllamaCompatProxy:
         options = payload.get("options", {})
         if not isinstance(options, dict):
             options = {}
+        snapshot = self._get_snapshot()
+        default_num_predict = int(snapshot.get("proxy_num_predict", 2048) or 2048)
         temperature = float(options.get("temperature", payload.get("temperature", 0.7)) or 0.7)
-        max_tokens = int(options.get("num_predict", payload.get("num_predict", 256)) or 256)
+        max_tokens = int(options.get("num_predict", payload.get("num_predict", default_num_predict)) or default_num_predict)
 
         try:
             text = self._forward_completion(slot, prompt, temperature, max_tokens)
@@ -765,8 +768,10 @@ class OllamaCompatProxy:
         options = payload.get("options", {})
         if not isinstance(options, dict):
             options = {}
+        snapshot = self._get_snapshot()
+        default_num_predict = int(snapshot.get("proxy_num_predict", 2048) or 2048)
         temperature = float(options.get("temperature", payload.get("temperature", 0.7)) or 0.7)
-        max_tokens = int(options.get("num_predict", payload.get("num_predict", 256)) or 256)
+        max_tokens = int(options.get("num_predict", payload.get("num_predict", default_num_predict)) or default_num_predict)
 
         try:
             text = self._forward_chat(slot, messages, temperature, max_tokens)
@@ -817,6 +822,7 @@ class MainWindow(QMainWindow):
         self._snapshot_lock = threading.Lock()
         self._ollama_snapshot: dict[str, Any] = {
             "default_server": 0,
+            "proxy_num_predict": 2048,
             "slots": [],
         }
         self.ollama_proxies: list[OllamaCompatProxy] = [
@@ -1220,6 +1226,17 @@ class MainWindow(QMainWindow):
         ollama_controls.addWidget(self.test_ollama_proxy_button)
         ollama_layout.addRow("Proxy Control", self._wrap_layout(ollama_controls))
 
+        self.proxy_num_predict_input = QSpinBox()
+        self.proxy_num_predict_input.setRange(1, 131072)
+        self.proxy_num_predict_input.setSingleStep(256)
+        self.proxy_num_predict_input.setValue(2048)
+        self.proxy_num_predict_input.setToolTip(
+            "Default max tokens for the Ollama proxy when clients don't specify num_predict.\n"
+            "Thinking models (e.g. Qwen3) need high values because reasoning tokens count towards this limit."
+        )
+        self.proxy_num_predict_input.valueChanged.connect(self._save_config)
+        ollama_layout.addRow("Default Max Tokens", self.proxy_num_predict_input)
+
         self.ollama_proxy_status = QLabel("Ollama API proxy is stopped.")
         ollama_layout.addRow("Proxy Status", self.ollama_proxy_status)
         self.ollama_proxy_test_status = QLabel("Proxy test idle.")
@@ -1373,6 +1390,7 @@ class MainWindow(QMainWindow):
                 cache_type_k_input=cache_type_k_input,
                 cache_type_v_input=cache_type_v_input,
                 flash_attn_checkbox=flash_attn_checkbox,
+                no_cache_prompt_checkbox=no_cache_prompt_checkbox,
                 auto_start_checkbox=auto_start_checkbox,
                 start_button=start_button,
                 stop_button=stop_button,
@@ -1567,6 +1585,7 @@ class MainWindow(QMainWindow):
 
         self.ollama_host_input.setText(str(data.get("ollama_host", "127.0.0.1") or "127.0.0.1"))
         self.ollama_port_input.setValue(int(data.get("ollama_port", 11434) or 11434))
+        self.proxy_num_predict_input.setValue(int(data.get("proxy_num_predict", 2048) or 2048))
 
         llama_paths = data.get("llama_paths", {})
         if not isinstance(llama_paths, dict):
@@ -1632,6 +1651,7 @@ class MainWindow(QMainWindow):
             if v_idx >= 0:
                 slot.cache_type_v_input.setCurrentIndex(v_idx)
             slot.flash_attn_checkbox.setChecked(bool(server_data.get("flash_attn", False)))
+            slot.no_cache_prompt_checkbox.setChecked(bool(server_data.get("no_cache_prompt", False)))
             slot.auto_start_checkbox.setChecked(bool(server_data.get("auto_start", False)))
 
             selected_device_keys = server_data.get("device_keys")
@@ -1668,6 +1688,7 @@ class MainWindow(QMainWindow):
                     "cache_type_k": slot.cache_type_k_input.currentText(),
                     "cache_type_v": slot.cache_type_v_input.currentText(),
                     "flash_attn": slot.flash_attn_checkbox.isChecked(),
+                    "no_cache_prompt": slot.no_cache_prompt_checkbox.isChecked(),
                     "auto_start": slot.auto_start_checkbox.isChecked(),
                     "device_keys": selected_keys,
                     "split_mode": slot.split_mode_input.currentText(),
@@ -1683,6 +1704,7 @@ class MainWindow(QMainWindow):
             "ollama_default_server": self.ollama_default_server_selector.currentIndex(),
             "ollama_host": self.ollama_host_input.text().strip() or "127.0.0.1",
             "ollama_port": self.ollama_port_input.value(),
+            "proxy_num_predict": self.proxy_num_predict_input.value(),
             "llama_paths": {
                 "cuda": self.cuda_llama_path_input.text().strip(),
                 "hip": self.hip_llama_path_input.text().strip(),
@@ -1955,6 +1977,7 @@ class MainWindow(QMainWindow):
 
         snapshot = {
             "default_server": self.ollama_default_server_selector.currentIndex(),
+            "proxy_num_predict": self.proxy_num_predict_input.value(),
             "slots": slots_payload,
         }
         with self._snapshot_lock:
@@ -2298,6 +2321,8 @@ class MainWindow(QMainWindow):
             arguments.extend(["--cache-type-v", cache_v])
         if slot.flash_attn_checkbox.isChecked():
             arguments.append("-fa")
+        if slot.no_cache_prompt_checkbox.isChecked():
+            arguments.append("--no-cache-prompt")
 
         extra_args = slot.extra_args_input.text().strip()
         if extra_args:
