@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import threading
@@ -25,6 +26,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QFileDialog,
     QFormLayout,
     QGridLayout,
@@ -226,20 +228,46 @@ class HuggingFaceClient:
         )
 
         files: list[RepoFile] = []
-        for sibling in info.siblings or []:
-            name = getattr(sibling, "rfilename", "")
-            if not name.lower().endswith(".gguf"):
-                continue
-            size_value = getattr(sibling, "size", None)
-            files.append(
-                RepoFile(
-                    name=name,
-                    size_text=self._format_size(size_value),
-                    size_bytes=size_value,
-                )
-            )
+        model_weight_extensions = {".safetensors", ".bin", ".pt", ".pth"}
+        has_model_weights = False
+        conversion_files: list[tuple[str, int]] = []
+        config_patterns = {
+            "config.json", "tokenizer.json", "tokenizer_config.json",
+            "special_tokens_map.json", "generation_config.json",
+            "tokenizer.model", "vocab.json", "merges.txt",
+        }
+        all_siblings = list(info.siblings or [])
 
-        return details, sorted(files, key=lambda item: item.name.lower())
+        for sibling in all_siblings:
+            name = getattr(sibling, "rfilename", "")
+            size_value = getattr(sibling, "size", None) or 0
+            lower_name = name.lower()
+            if lower_name.endswith(".gguf"):
+                files.append(
+                    RepoFile(
+                        name=name,
+                        size_text=self._format_size(size_value if size_value else None),
+                        size_bytes=size_value if size_value else None,
+                    )
+                )
+            elif any(lower_name.endswith(ext) for ext in model_weight_extensions):
+                has_model_weights = True
+                conversion_files.append((name, int(size_value)))
+
+        if has_model_weights:
+            for sibling in all_siblings:
+                name = getattr(sibling, "rfilename", "")
+                size_value = getattr(sibling, "size", None) or 0
+                base_name = Path(name).name.lower()
+                if base_name in config_patterns:
+                    conversion_files.append((name, int(size_value)))
+
+        return (
+            details,
+            sorted(files, key=lambda item: item.name.lower()),
+            has_model_weights,
+            conversion_files,
+        )
 
     def download_file(
         self,
@@ -311,6 +339,143 @@ class HuggingFaceClient:
                 return f"{size:.1f} {unit}"
             size /= 1024
         return ""
+
+
+class ConversionProgressDialog(QDialog):
+    """Modal dialog showing download + conversion progress with ETA."""
+
+    cancelled = Signal()
+
+    def __init__(self, parent: QWidget, repo_id: str) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"Convert to GGUF \u2014 {repo_id}")
+        self.setMinimumWidth(560)
+        self.setMinimumHeight(360)
+        self.setModal(True)
+        self._cancelled = False
+        self._phase_start = 0.0
+
+        layout = QVBoxLayout(self)
+
+        self.phase_label = QLabel("Preparing\u2026")
+        font = self.phase_label.font()
+        font.setPointSize(font.pointSize() + 2)
+        font.setBold(True)
+        self.phase_label.setFont(font)
+        layout.addWidget(self.phase_label)
+
+        self.status_label = QLabel("")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        layout.addWidget(self.progress_bar)
+
+        self.eta_label = QLabel("")
+        layout.addWidget(self.eta_label)
+
+        self.detail_output = QPlainTextEdit()
+        self.detail_output.setReadOnly(True)
+        self.detail_output.setMaximumHeight(150)
+        self.detail_output.setPlaceholderText("Conversion output will appear here\u2026")
+        layout.addWidget(self.detail_output)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.clicked.connect(self._handle_cancel)
+        btn_layout.addWidget(self.cancel_button)
+        layout.addLayout(btn_layout)
+
+    # -- public helpers ------------------------------------------------ #
+
+    @property
+    def is_cancelled(self) -> bool:
+        return self._cancelled
+
+    def set_phase(self, phase: str) -> None:
+        self.phase_label.setText(phase)
+        self._phase_start = time.monotonic()
+        self.progress_bar.setValue(0)
+        self.eta_label.setText("Estimating time remaining\u2026")
+
+    def set_progress(self, percent: int, status: str = "") -> None:
+        self.progress_bar.setValue(max(0, min(100, percent)))
+        if status:
+            self.status_label.setText(status)
+        if percent > 0 and self._phase_start > 0:
+            elapsed = time.monotonic() - self._phase_start
+            estimated_total = elapsed / (percent / 100.0)
+            remaining = max(0.0, estimated_total - elapsed)
+            self.eta_label.setText(self._format_eta(remaining))
+
+    def set_status(self, text: str) -> None:
+        self.status_label.setText(text)
+
+    def set_eta(self, seconds: float) -> None:
+        self.eta_label.setText(self._format_eta(seconds))
+
+    def append_log(self, text: str) -> None:
+        self.detail_output.appendPlainText(text)
+
+    def mark_complete(self, output_path: str) -> None:
+        self.progress_bar.setValue(100)
+        self.phase_label.setText("Conversion Complete")
+        self.status_label.setText(f"GGUF saved to:\n{output_path}")
+        self.eta_label.setText("")
+        self.cancel_button.setText("Close")
+        self.cancel_button.setEnabled(True)
+        try:
+            self.cancel_button.clicked.disconnect()
+        except RuntimeError:
+            pass
+        self.cancel_button.clicked.connect(self.accept)
+
+    def mark_failed(self, message: str) -> None:
+        self.phase_label.setText("Conversion Failed")
+        self.status_label.setText(message)
+        self.eta_label.setText("")
+        self.cancel_button.setText("Close")
+        self.cancel_button.setEnabled(True)
+        try:
+            self.cancel_button.clicked.disconnect()
+        except RuntimeError:
+            pass
+        self.cancel_button.clicked.connect(self.reject)
+
+    # -- internals ----------------------------------------------------- #
+
+    def _handle_cancel(self) -> None:
+        if self._cancelled:
+            self.reject()
+            return
+        self._cancelled = True
+        self.cancel_button.setEnabled(False)
+        self.status_label.setText("Cancelling\u2026")
+        self.cancelled.emit()
+
+    @staticmethod
+    def _format_eta(seconds: float) -> str:
+        if seconds < 1:
+            return "Almost done\u2026"
+        if seconds < 60:
+            return f"Estimated time remaining: {int(seconds)}s"
+        mins = int(seconds) // 60
+        secs = int(seconds) % 60
+        if mins >= 60:
+            hours = mins // 60
+            mins = mins % 60
+            return f"Estimated time remaining: {hours}h {mins}m"
+        return f"Estimated time remaining: {mins}m {secs}s"
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        if not self._cancelled and self.cancel_button.text() != "Close":
+            event.ignore()
+            self._handle_cancel()
+        else:
+            super().closeEvent(event)
 
 
 class LlamaServerClient:
@@ -814,6 +979,11 @@ class MainWindow(QMainWindow):
         self.search_results: list[ModelSearchResult] = []
         self.repo_files: list[RepoFile] = []
         self.repo_details: RepoDetails | None = None
+        self.conversion_files: list[tuple[str, int]] = []
+        self.has_model_weights: bool = False
+        self._conversion_cancelled = False
+        self._conversion_dialog: ConversionProgressDialog | None = None
+        self._conversion_current_phase = ""
         self.chat_history: list[dict[str, str]] = []
         self.pending_user_message = ""
         self.available_devices: list[GPUDevice] = self._detect_available_devices()
@@ -1156,6 +1326,16 @@ class MainWindow(QMainWindow):
         download_row.addWidget(self.download_button)
         download_row.addWidget(self.browse_models_button)
 
+        convert_row = QHBoxLayout()
+        self.convert_to_gguf_button = QPushButton("Download && Convert to GGUF")
+        self.convert_to_gguf_button.clicked.connect(self.start_hf_conversion)
+        self.convert_to_gguf_button.setEnabled(False)
+        self.convert_to_gguf_button.setToolTip(
+            "Download non-GGUF model weights (SafeTensors, etc.) and convert to GGUF format.\n"
+            "Requires: gguf, numpy, torch, safetensors, transformers (pip packages)."
+        )
+        convert_row.addWidget(self.convert_to_gguf_button)
+
         self.download_progress = QProgressBar()
         self.download_progress.setRange(0, 100)
         self.download_progress.setValue(0)
@@ -1163,6 +1343,7 @@ class MainWindow(QMainWindow):
 
         files_layout.addWidget(self.files_list)
         files_layout.addLayout(download_row)
+        files_layout.addLayout(convert_row)
         files_layout.addWidget(self.download_progress)
         files_layout.addWidget(self.download_status)
 
@@ -1749,6 +1930,7 @@ class MainWindow(QMainWindow):
         self.results_table.setRowCount(0)
         self.files_list.clear()
         self.download_button.setEnabled(False)
+        self.convert_to_gguf_button.setEnabled(False)
         self._clear_repo_details("Searching...")
 
         worker = Worker(self.hf_client.search_models, query, token)
@@ -1790,6 +1972,7 @@ class MainWindow(QMainWindow):
         self.files_list.clear()
         self.files_list.addItem("Loading GGUF files...")
         self.download_button.setEnabled(False)
+        self.convert_to_gguf_button.setEnabled(False)
         self.repo_title_label.setText(repo_id)
         self.repo_meta_label.setText("Loading metadata...")
         self.repo_summary_text.setPlainText("")
@@ -1799,10 +1982,12 @@ class MainWindow(QMainWindow):
         worker.signals.error.connect(self._show_repo_files_error)
         self.thread_pool.start(worker)
 
-    def _populate_repo_details(self, payload: tuple[RepoDetails, list[RepoFile]]) -> None:
-        details, files = payload
+    def _populate_repo_details(self, payload: tuple) -> None:
+        details, files, has_model_weights, conversion_files = payload
         self.repo_details = details
         self.repo_files = files
+        self.has_model_weights = has_model_weights
+        self.conversion_files = conversion_files
 
         self.repo_title_label.setText(details.repo_id)
         meta_parts = [
@@ -1833,7 +2018,22 @@ class MainWindow(QMainWindow):
 
         self.files_list.clear()
         if not files:
-            self.files_list.addItem("No GGUF files were found in this repo.")
+            if has_model_weights:
+                weight_exts: set[str] = set()
+                for fname, _ in conversion_files:
+                    ext = Path(fname).suffix.lower()
+                    if ext in {".safetensors", ".bin", ".pt", ".pth"}:
+                        weight_exts.add(ext.lstrip("."))
+                total_size = sum(s for _, s in conversion_files)
+                ext_text = ", ".join(sorted(weight_exts))
+                self.files_list.addItem(
+                    f"No GGUF files \u2014 this repo has {ext_text} weights "
+                    f"({self._format_bytes(total_size)}) that can be converted to GGUF."
+                )
+                self.convert_to_gguf_button.setEnabled(True)
+            else:
+                self.files_list.addItem("No GGUF files were found in this repo.")
+                self.convert_to_gguf_button.setEnabled(False)
             self.download_button.setEnabled(False)
             return
 
@@ -1845,11 +2045,13 @@ class MainWindow(QMainWindow):
 
         self.files_list.setCurrentRow(0)
         self.download_button.setEnabled(True)
+        self.convert_to_gguf_button.setEnabled(False)
 
     def _show_repo_files_error(self, message: str) -> None:
         self.files_list.clear()
         self.files_list.addItem("Failed to load files.")
         self._clear_repo_details("Failed to load repository details.")
+        self.convert_to_gguf_button.setEnabled(False)
         QMessageBox.critical(self, "Repository Load Failed", message)
 
     def _clear_repo_details(self, title: str) -> None:
@@ -1941,6 +2143,387 @@ class MainWindow(QMainWindow):
         self.download_progress.setValue(0)
         self.download_status.setText("Download failed.")
         QMessageBox.critical(self, "Download Failed", message)
+
+    # ------------------------------------------------------------------ #
+    #  HuggingFace → GGUF conversion                                      #
+    # ------------------------------------------------------------------ #
+
+    def start_hf_conversion(self) -> None:
+        """Initiate download and conversion of a non-GGUF HF model to GGUF."""
+        repo_id = self._selected_repo_id()
+        if not repo_id:
+            QMessageBox.warning(self, "No Repository", "Select a repository first.")
+            return
+
+        if not self.conversion_files:
+            QMessageBox.warning(self, "No Model Files", "No convertible model files found.")
+            return
+
+        # Locate the convert script
+        convert_script = self._find_convert_script()
+        if not convert_script:
+            reply = QMessageBox.question(
+                self,
+                "Download Converter",
+                "convert_hf_to_gguf.py was not found locally.\n\n"
+                "Would you like to download it from the llama.cpp repository?\n"
+                "(Only the converter script will be downloaded, ~200 KB)",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if reply == QMessageBox.Yes:
+                convert_script = self._download_convert_script()
+            if not convert_script:
+                return
+
+        # Check for required Python packages
+        missing = self._check_conversion_deps()
+        if missing:
+            reply = QMessageBox.question(
+                self,
+                "Missing Dependencies",
+                f"The following Python packages are required for GGUF conversion:\n\n"
+                f"  {', '.join(missing)}\n\n"
+                f"Install them now with pip?\n"
+                f"(torch may be a large download)",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if reply == QMessageBox.Yes:
+                if not self._install_conversion_deps(missing):
+                    return
+                # Re-check after install
+                still_missing = self._check_conversion_deps()
+                if still_missing:
+                    QMessageBox.critical(
+                        self,
+                        "Dependencies Still Missing",
+                        f"These packages could not be installed:\n{', '.join(still_missing)}",
+                    )
+                    return
+            else:
+                return
+
+        # Confirm
+        total_size = sum(s for _, s in self.conversion_files)
+        file_count = len(self.conversion_files)
+        reply = QMessageBox.question(
+            self,
+            "Download & Convert to GGUF",
+            f"Repo: {repo_id}\n\n"
+            f"This will download {file_count} file(s) ({self._format_bytes(total_size)}) "
+            f"and convert them to GGUF (f16) format.\n\n"
+            f"The GGUF model will be saved to the models/ folder.\n\n"
+            f"Proceed?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        # Create and show progress dialog
+        self._conversion_cancelled = False
+        self._conversion_current_phase = ""
+        dialog = ConversionProgressDialog(self, repo_id)
+        dialog.cancelled.connect(self._cancel_conversion)
+        self._conversion_dialog = dialog
+
+        token = self.hf_token_input.text().strip()
+
+        worker = Worker(
+            self._conversion_worker,
+            repo_id,
+            list(self.conversion_files),
+            token,
+            "f16",
+            str(convert_script),
+            use_progress=True,
+        )
+        worker.signals.progress.connect(self._on_conversion_progress)
+        worker.signals.finished.connect(self._on_conversion_complete)
+        worker.signals.error.connect(self._on_conversion_error)
+        self.thread_pool.start(worker)
+
+        self.convert_to_gguf_button.setEnabled(False)
+        dialog.exec()
+
+    def _cancel_conversion(self) -> None:
+        self._conversion_cancelled = True
+
+    def _find_convert_script(self) -> Path | None:
+        """Search for convert_hf_to_gguf.py in common locations."""
+        workspace = Path(__file__).resolve().parent
+        candidates: list[Path] = [
+            workspace / "scripts" / "convert_hf_to_gguf.py",
+            workspace / "convert_hf_to_gguf.py",
+        ]
+        # Check near configured llama-server paths
+        for backend in ("cuda", "hip", "vulkan", "cpu"):
+            configured = self._llama_path_input_for_backend(backend).text().strip()
+            if configured:
+                base = Path(configured).parent
+                candidates.extend([
+                    base / "convert_hf_to_gguf.py",
+                    base.parent / "convert_hf_to_gguf.py",
+                ])
+        # Common source checkout locations
+        candidates.extend([
+            workspace / "llama.cpp" / "convert_hf_to_gguf.py",
+            Path.home() / "llama.cpp" / "convert_hf_to_gguf.py",
+        ])
+        for path in candidates:
+            if path.exists():
+                return path
+        return None
+
+    def _download_convert_script(self) -> Path | None:
+        """Download convert_hf_to_gguf.py from the llama.cpp GitHub repo."""
+        url = "https://raw.githubusercontent.com/ggml-org/llama.cpp/master/convert_hf_to_gguf.py"
+        dest = Path(__file__).resolve().parent / "scripts" / "convert_hf_to_gguf.py"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            response = requests.get(url, timeout=30)
+            response.raise_for_status()
+            dest.write_text(response.text, encoding="utf-8")
+            self.log_output.appendPlainText(f"[CONVERT] Downloaded convert_hf_to_gguf.py → {dest}")
+            return dest
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(
+                self,
+                "Download Failed",
+                f"Failed to download convert_hf_to_gguf.py:\n{exc}",
+            )
+            return None
+
+    @staticmethod
+    def _check_conversion_deps() -> list[str]:
+        """Return list of pip package names that are missing."""
+        required = {
+            "numpy": "numpy",
+            "torch": "torch",
+            "safetensors": "safetensors",
+            "transformers": "transformers",
+            "sentencepiece": "sentencepiece",
+            "gguf": "gguf",
+        }
+        missing: list[str] = []
+        for module_name, pip_name in required.items():
+            try:
+                __import__(module_name)
+            except ImportError:
+                missing.append(pip_name)
+        return missing
+
+    def _install_conversion_deps(self, packages: list[str]) -> bool:
+        """Install pip packages. Returns True on success."""
+        self.log_output.appendPlainText(f"[CONVERT] Installing: {' '.join(packages)}")
+        try:
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "--quiet"] + packages,
+                capture_output=True,
+                text=True,
+                timeout=600,
+                check=False,
+            )
+            if result.returncode != 0:
+                error = result.stderr.strip() or result.stdout.strip()
+                QMessageBox.critical(self, "Install Failed", f"pip install failed:\n{error}")
+                return False
+            self.log_output.appendPlainText("[CONVERT] Dependencies installed successfully.")
+            return True
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "Install Failed", f"pip install error:\n{exc}")
+            return False
+
+    def _conversion_worker(
+        self,
+        repo_id: str,
+        files: list[tuple[str, int]],
+        token: str,
+        output_type: str,
+        convert_script_path: str,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> Path:
+        """Background worker: downloads HF model files then converts to GGUF."""
+        cb = progress_callback or (lambda _: None)
+
+        # ── Phase 1: Download ──────────────────────────────────────────
+        staging_dir = MODELS_DIR / f"_converting_{repo_id.replace('/', '_')}"
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        total_bytes = sum(size for _, size in files)
+        downloaded_total = 0
+        started = time.monotonic()
+
+        cb({"phase": "download", "status": "Starting download…", "percent": 0})
+
+        for filename, _file_size in files:
+            if self._conversion_cancelled:
+                raise RuntimeError("Cancelled by user.")
+
+            url = hf_hub_url(repo_id=repo_id, filename=filename)
+            headers: dict[str, str] = {}
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+
+            dest_path = staging_dir / filename
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+
+            with requests.get(url, headers=headers, stream=True, timeout=60) as resp:
+                resp.raise_for_status()
+                with dest_path.open("wb") as fh:
+                    for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                        if self._conversion_cancelled:
+                            raise RuntimeError("Cancelled by user.")
+                        if not chunk:
+                            continue
+                        fh.write(chunk)
+                        downloaded_total += len(chunk)
+
+                        pct = min(99, int(downloaded_total * 100 / total_bytes)) if total_bytes else 0
+                        elapsed = max(time.monotonic() - started, 0.001)
+                        speed = downloaded_total / elapsed
+                        eta = (total_bytes - downloaded_total) / speed if speed > 0 else 0
+                        cb({
+                            "phase": "download",
+                            "status": (
+                                f"Downloading {Path(filename).name}  —  "
+                                f"{self._format_bytes(downloaded_total)} / "
+                                f"{self._format_bytes(total_bytes)}  at "
+                                f"{self._format_bytes(speed)}/s"
+                            ),
+                            "percent": pct,
+                            "eta": eta,
+                        })
+
+        cb({"phase": "download", "status": "Download complete.", "percent": 100})
+
+        # ── Phase 2: Convert ───────────────────────────────────────────
+        safe_name = repo_id.replace("/", "_")
+        output_filename = f"{safe_name}-{output_type}.gguf"
+        output_path = MODELS_DIR / output_filename
+
+        cmd = [
+            sys.executable,
+            convert_script_path,
+            str(staging_dir),
+            "--outfile", str(output_path),
+            "--outtype", output_type,
+        ]
+
+        cb({
+            "phase": "convert",
+            "status": "Starting GGUF conversion…",
+            "percent": 0,
+            "log": f"> {' '.join(cmd)}",
+        })
+
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+
+        output_lines: list[str] = []
+        conv_started = time.monotonic()
+        while True:
+            if self._conversion_cancelled:
+                process.kill()
+                raise RuntimeError("Cancelled by user.")
+            line = process.stdout.readline()  # type: ignore[union-attr]
+            if not line and process.poll() is not None:
+                break
+            if line:
+                stripped = line.rstrip()
+                output_lines.append(stripped)
+                pct = self._parse_convert_progress(stripped, conv_started)
+                payload: dict[str, Any] = {"phase": "convert", "log": stripped}
+                if pct >= 0:
+                    payload["percent"] = pct
+                    payload["status"] = stripped
+                cb(payload)
+
+        return_code = process.wait()
+        if return_code != 0:
+            error_tail = "\n".join(output_lines[-30:])
+            raise RuntimeError(
+                f"Conversion failed (exit code {return_code}):\n\n{error_tail}"
+            )
+
+        if not output_path.exists():
+            raise RuntimeError(f"Conversion finished but output not found: {output_path}")
+
+        # Clean up staging directory
+        try:
+            shutil.rmtree(staging_dir)
+        except OSError:
+            pass
+
+        cb({"phase": "convert", "status": "Conversion complete!", "percent": 100})
+        return output_path
+
+    @staticmethod
+    def _parse_convert_progress(line: str, _start_time: float) -> int:
+        """Try to extract a progress percentage from convert script output."""
+        match = re.search(r"(\d+(?:\.\d+)?)\s*%", line)
+        if match:
+            return min(99, int(float(match.group(1))))
+        lower = line.lower()
+        if "loading" in lower:
+            return 10
+        if "converting" in lower or "processing" in lower:
+            return 30
+        if "writing" in lower:
+            return 70
+        if "done" in lower or "success" in lower or "complete" in lower:
+            return 95
+        return -1
+
+    def _on_conversion_progress(self, payload: dict[str, Any]) -> None:
+        dialog = self._conversion_dialog
+        if not dialog:
+            return
+
+        phase = payload.get("phase", "")
+        status = payload.get("status", "")
+        percent = payload.get("percent", -1)
+        log_line = payload.get("log", "")
+        eta = payload.get("eta", -1.0)
+
+        if phase and phase != self._conversion_current_phase:
+            self._conversion_current_phase = phase
+            if phase == "download":
+                dialog.set_phase("Phase 1/2 — Downloading Model Files")
+            elif phase == "convert":
+                dialog.set_phase("Phase 2/2 — Converting to GGUF")
+
+        if percent >= 0:
+            dialog.set_progress(percent, status)
+        elif status:
+            dialog.set_status(status)
+
+        if eta >= 0:
+            dialog.set_eta(eta)
+
+        if log_line:
+            dialog.append_log(log_line)
+
+    def _on_conversion_complete(self, output_path: Path) -> None:
+        dialog = self._conversion_dialog
+        if dialog:
+            dialog.mark_complete(str(output_path.resolve()))
+
+        # Set the converted model path in the target server slot
+        target_index = self._resolve_server_index(None)
+        self.server_slots[target_index].model_path_input.setText(str(output_path.resolve()))
+        self._save_config()
+        self.log_output.appendPlainText(f"[CONVERT] GGUF saved: {output_path.resolve()}")
+        self.convert_to_gguf_button.setEnabled(True)
+
+    def _on_conversion_error(self, message: str) -> None:
+        dialog = self._conversion_dialog
+        if dialog:
+            dialog.mark_failed(message)
+        self.log_output.appendPlainText(f"[CONVERT] Failed: {message}")
+        self.convert_to_gguf_button.setEnabled(True)
 
     def _resolve_server_index(self, slot_index: int | None) -> int:
         if slot_index is not None and 0 <= slot_index < len(self.server_slots):
