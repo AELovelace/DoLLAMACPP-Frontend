@@ -59,6 +59,7 @@ APP_NAME = "DoLLAMACPP Frontend"
 CONFIG_PATH = Path("frontend_config.json")
 MODELS_DIR = Path("models")
 LLAMA_CPP_RELEASES_URL = "https://github.com/ggml-org/llama.cpp/releases"
+OLLAMA_BLOBS_DIR = Path(os.environ.get("OLLAMA_MODELS", "")) / "blobs" if os.environ.get("OLLAMA_MODELS") else Path.home() / ".ollama" / "models" / "blobs"
 
 
 def normalize_connect_host(host: str) -> str:
@@ -1167,6 +1168,7 @@ class MainWindow(QMainWindow):
         tabs = QTabWidget()
         tabs.addTab(self._build_app_settings_tab(), "App Settings")
         tabs.addTab(self._build_hf_tab(), "Hugging Face Search")
+        tabs.addTab(self._build_ollama_tab(), "Ollama Models")
         tabs.addTab(self._build_global_settings_tab(), "Global Settings")
         tabs.addTab(self._build_server_slots_tab(), "Server Slots")
         tabs.addTab(self._build_log_panel(), "Server Log")
@@ -1604,6 +1606,83 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.repo_meta_label)
         layout.addWidget(self.repo_summary_text)
         return box
+
+    # ------------------------------------------------------------------ #
+    #  Ollama Models tab                                                   #
+    # ------------------------------------------------------------------ #
+
+    def _build_ollama_tab(self) -> QWidget:
+        container = QWidget()
+        outer = QVBoxLayout(container)
+
+        # ── Pull Model ────────────────────────────────────────────────
+        pull_box = QGroupBox("Pull Model from Ollama Registry")
+        pull_layout = QVBoxLayout(pull_box)
+
+        pull_row = QHBoxLayout()
+        self.ollama_pull_input = QLineEdit()
+        self.ollama_pull_input.setPlaceholderText(
+            "Model name, e.g.  llama3:8b  or  qwen3:0.6b  or  gemma3:4b-it-qat"
+        )
+        self.ollama_pull_input.returnPressed.connect(self._ollama_pull_model)
+        self.ollama_pull_button = QPushButton("Pull")
+        self.ollama_pull_button.clicked.connect(self._ollama_pull_model)
+        pull_row.addWidget(self.ollama_pull_input)
+        pull_row.addWidget(self.ollama_pull_button)
+
+        self.ollama_pull_progress = QProgressBar()
+        self.ollama_pull_progress.setRange(0, 100)
+        self.ollama_pull_progress.setValue(0)
+        self.ollama_pull_status = QLabel("Enter a model name and click Pull.")
+
+        pull_layout.addLayout(pull_row)
+        pull_layout.addWidget(self.ollama_pull_progress)
+        pull_layout.addWidget(self.ollama_pull_status)
+
+        # ── Extract GGUF ──────────────────────────────────────────────
+        extract_box = QGroupBox("Extract GGUF from Local Ollama Models")
+        extract_layout = QVBoxLayout(extract_box)
+
+        extract_top_row = QHBoxLayout()
+        self.ollama_refresh_button = QPushButton("Refresh Model List")
+        self.ollama_refresh_button.clicked.connect(self._ollama_refresh_models)
+        extract_top_row.addWidget(self.ollama_refresh_button)
+        extract_top_row.addStretch()
+
+        self.ollama_models_table = QTableWidget(0, 4)
+        self.ollama_models_table.setHorizontalHeaderLabels(["Name", "ID", "Size", "Modified"])
+        self.ollama_models_table.horizontalHeader().setStretchLastSection(True)
+        self.ollama_models_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.ollama_models_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.ollama_models_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+
+        extract_btn_row = QHBoxLayout()
+        self.ollama_extract_button = QPushButton("Extract GGUF to models/")
+        self.ollama_extract_button.clicked.connect(self._ollama_extract_gguf)
+        self.ollama_extract_button.setEnabled(False)
+        self.ollama_extract_button.setToolTip(
+            "Copy the GGUF blob from Ollama's storage into the models/ folder\n"
+            "and set it as the model path on the selected target server slot."
+        )
+        extract_btn_row.addWidget(self.ollama_extract_button)
+        extract_btn_row.addStretch()
+
+        self.ollama_extract_status = QLabel("Click Refresh to list locally-pulled Ollama models.")
+
+        self.ollama_models_table.itemSelectionChanged.connect(
+            lambda: self.ollama_extract_button.setEnabled(
+                self.ollama_models_table.currentRow() >= 0
+            )
+        )
+
+        extract_layout.addLayout(extract_top_row)
+        extract_layout.addWidget(self.ollama_models_table)
+        extract_layout.addLayout(extract_btn_row)
+        extract_layout.addWidget(self.ollama_extract_status)
+
+        outer.addWidget(pull_box)
+        outer.addWidget(extract_box)
+        return container
 
     def _build_log_panel(self) -> QWidget:
         box = QGroupBox("Server Log")
@@ -2613,6 +2692,308 @@ class MainWindow(QMainWindow):
             dialog.mark_failed(message)
         self.log_output.appendPlainText(f"[CONVERT] Failed: {message}")
         self.convert_to_gguf_button.setEnabled(True)
+
+    # ------------------------------------------------------------------ #
+    #  Ollama pull / extract                                               #
+    # ------------------------------------------------------------------ #
+
+    def _ollama_pull_model(self) -> None:
+        """Pull a model from the Ollama registry via `ollama pull`."""
+        model_name = self.ollama_pull_input.text().strip()
+        if not model_name:
+            QMessageBox.warning(self, "No Model Name", "Enter a model name first, e.g. llama3:8b")
+            return
+
+        ollama_exe = shutil.which("ollama")
+        if not ollama_exe:
+            QMessageBox.critical(
+                self,
+                "Ollama Not Found",
+                "Could not find 'ollama' on PATH.\n\n"
+                "Install Ollama from https://ollama.com and make sure it's on your PATH.",
+            )
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Pull Ollama Model",
+            f"Pull model '{model_name}' from the Ollama registry?\n\n"
+            f"This will download the model into Ollama's local storage.\n"
+            f"You can then extract the GGUF file to the models/ folder.",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        self.ollama_pull_button.setEnabled(False)
+        self.ollama_pull_progress.setRange(0, 0)  # indeterminate
+        self.ollama_pull_status.setText(f"Pulling {model_name}…")
+
+        worker = Worker(self._ollama_pull_worker, ollama_exe, model_name, use_progress=True)
+        worker.signals.progress.connect(self._on_ollama_pull_progress)
+        worker.signals.finished.connect(self._on_ollama_pull_complete)
+        worker.signals.error.connect(self._on_ollama_pull_error)
+        self.thread_pool.start(worker)
+
+    def _ollama_pull_worker(
+        self,
+        ollama_exe: str,
+        model_name: str,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> str:
+        """Run `ollama pull <model>` and emit progress."""
+        cb = progress_callback or (lambda _: None)
+        process = subprocess.Popen(
+            [ollama_exe, "pull", model_name],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        last_status = ""
+        while True:
+            line = process.stdout.readline()  # type: ignore[union-attr]
+            if not line and process.poll() is not None:
+                break
+            if line:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                last_status = stripped
+                # Try to parse percentage from ollama output, e.g. "pulling abc123… 45%"
+                pct_match = re.search(r"(\d+)%", stripped)
+                if pct_match:
+                    cb({"status": stripped, "percent": int(pct_match.group(1))})
+                else:
+                    cb({"status": stripped, "percent": -1})
+
+        rc = process.wait()
+        if rc != 0:
+            raise RuntimeError(f"ollama pull failed (exit {rc}): {last_status}")
+        return model_name
+
+    def _on_ollama_pull_progress(self, payload: dict[str, Any]) -> None:
+        status = payload.get("status", "")
+        percent = payload.get("percent", -1)
+        if percent >= 0:
+            self.ollama_pull_progress.setRange(0, 100)
+            self.ollama_pull_progress.setValue(percent)
+        if status:
+            self.ollama_pull_status.setText(status)
+
+    def _on_ollama_pull_complete(self, model_name: str) -> None:
+        self.ollama_pull_button.setEnabled(True)
+        self.ollama_pull_progress.setRange(0, 100)
+        self.ollama_pull_progress.setValue(100)
+        self.ollama_pull_status.setText(f"Successfully pulled '{model_name}'.")
+        self.log_output.appendPlainText(f"[OLLAMA] Pulled model: {model_name}")
+        # Auto-refresh the local model list
+        self._ollama_refresh_models()
+
+    def _on_ollama_pull_error(self, message: str) -> None:
+        self.ollama_pull_button.setEnabled(True)
+        self.ollama_pull_progress.setRange(0, 100)
+        self.ollama_pull_progress.setValue(0)
+        self.ollama_pull_status.setText("Pull failed.")
+        QMessageBox.critical(self, "Ollama Pull Failed", message)
+
+    # ── Refresh / list local models ───────────────────────────────────
+
+    def _ollama_refresh_models(self) -> None:
+        """Populate the local Ollama models table via `ollama list`."""
+        ollama_exe = shutil.which("ollama")
+        if not ollama_exe:
+            self.ollama_extract_status.setText("'ollama' not found on PATH.")
+            return
+
+        self.ollama_refresh_button.setEnabled(False)
+        self.ollama_extract_status.setText("Loading model list…")
+
+        worker = Worker(self._ollama_list_worker, ollama_exe)
+        worker.signals.finished.connect(self._on_ollama_list_complete)
+        worker.signals.error.connect(self._on_ollama_list_error)
+        self.thread_pool.start(worker)
+
+    @staticmethod
+    def _ollama_list_worker(ollama_exe: str) -> list[dict[str, str]]:
+        result = subprocess.run(
+            [ollama_exe, "list"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or "ollama list failed")
+
+        lines = result.stdout.strip().splitlines()
+        if not lines:
+            return []
+
+        # First line is header: NAME  ID  SIZE  MODIFIED
+        models: list[dict[str, str]] = []
+        for line in lines[1:]:
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            name = parts[0]
+            model_id = parts[1]
+            # Size is typically "4.9 GB" (two tokens)
+            size_str = f"{parts[2]} {parts[3]}" if len(parts) > 3 else parts[2]
+            modified = " ".join(parts[4:]) if len(parts) > 4 else ""
+            models.append({
+                "name": name,
+                "id": model_id,
+                "size": size_str,
+                "modified": modified,
+            })
+        return models
+
+    def _on_ollama_list_complete(self, models: list[dict[str, str]]) -> None:
+        self.ollama_refresh_button.setEnabled(True)
+        self.ollama_models_table.setRowCount(0)
+        for row_idx, model in enumerate(models):
+            self.ollama_models_table.insertRow(row_idx)
+            self.ollama_models_table.setItem(row_idx, 0, QTableWidgetItem(model["name"]))
+            self.ollama_models_table.setItem(row_idx, 1, QTableWidgetItem(model["id"]))
+            self.ollama_models_table.setItem(row_idx, 2, QTableWidgetItem(model["size"]))
+            self.ollama_models_table.setItem(row_idx, 3, QTableWidgetItem(model["modified"]))
+        self.ollama_extract_button.setEnabled(False)
+        self.ollama_extract_status.setText(f"{len(models)} model(s) found. Select one to extract.")
+
+    def _on_ollama_list_error(self, message: str) -> None:
+        self.ollama_refresh_button.setEnabled(True)
+        self.ollama_extract_status.setText(f"Failed: {message}")
+
+    # ── Extract GGUF blob ─────────────────────────────────────────────
+
+    def _ollama_extract_gguf(self) -> None:
+        """Extract the GGUF blob for the selected Ollama model."""
+        row = self.ollama_models_table.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "No Model Selected", "Select a model from the list first.")
+            return
+
+        model_name = self.ollama_models_table.item(row, 0).text()
+        ollama_exe = shutil.which("ollama")
+        if not ollama_exe:
+            QMessageBox.critical(self, "Ollama Not Found", "'ollama' not found on PATH.")
+            return
+
+        self.ollama_extract_button.setEnabled(False)
+        self.ollama_extract_status.setText(f"Resolving blob hash for {model_name}…")
+
+        worker = Worker(self._ollama_extract_worker, ollama_exe, model_name)
+        worker.signals.finished.connect(self._on_ollama_extract_complete)
+        worker.signals.error.connect(self._on_ollama_extract_error)
+        self.thread_pool.start(worker)
+
+    @staticmethod
+    def _ollama_extract_worker(ollama_exe: str, model_name: str) -> dict[str, str]:
+        """Resolve blob hash via `ollama show --modelfile`, find blob, copy to models/."""
+        result = subprocess.run(
+            [ollama_exe, "show", model_name, "--modelfile"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"ollama show failed:\n{result.stderr.strip() or result.stdout.strip()}"
+            )
+
+        # Parse the FROM line to get the blob hash
+        blob_hash = None
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if line.upper().startswith("FROM"):
+                value = line.split(None, 1)[-1].strip()
+                # Value is something like  /path/to/blob  or  sha256:abc123...
+                if "sha256" in value.lower():
+                    # Extract just the hash part
+                    blob_hash = value.replace(":", "-")
+                    break
+                elif Path(value).exists():
+                    # Direct path to the blob file
+                    blob_hash = value
+                    break
+
+        if not blob_hash:
+            raise RuntimeError(
+                f"Could not find a FROM sha256:… line in modelfile for '{model_name}'.\n\n"
+                f"Output:\n{result.stdout[:500]}"
+            )
+
+        # Locate the actual blob file
+        if Path(blob_hash).exists():
+            blob_path = Path(blob_hash)
+        else:
+            blob_path = OLLAMA_BLOBS_DIR / blob_hash
+            if not blob_path.exists():
+                # Try with sha256- prefix format
+                alt = blob_hash.replace("sha256-", "sha256:")
+                alt_path = OLLAMA_BLOBS_DIR / alt
+                if alt_path.exists():
+                    blob_path = alt_path
+
+        if not blob_path.exists():
+            raise RuntimeError(
+                f"Blob file not found.\n\n"
+                f"Looked for: {blob_path}\n"
+                f"Blobs dir: {OLLAMA_BLOBS_DIR}\n\n"
+                f"If your OLLAMA_MODELS env var points elsewhere, set it before launching."
+            )
+
+        # Copy to models/ with a .gguf name
+        safe_name = re.sub(r"[^a-zA-Z0-9._-]", "_", model_name)
+        dest = MODELS_DIR / f"{safe_name}.gguf"
+        MODELS_DIR.mkdir(parents=True, exist_ok=True)
+
+        # If file already exists, add a suffix
+        if dest.exists():
+            stem = dest.stem
+            for i in range(1, 100):
+                candidate = MODELS_DIR / f"{stem}_{i}.gguf"
+                if not candidate.exists():
+                    dest = candidate
+                    break
+
+        shutil.copy2(blob_path, dest)
+        return {"model_name": model_name, "path": str(dest.resolve()), "size": blob_path.stat().st_size}
+
+    def _on_ollama_extract_complete(self, result: dict[str, str]) -> None:
+        model_name = result["model_name"]
+        dest_path = result["path"]
+        size = int(result.get("size", 0) or 0)
+        size_text = self._format_bytes(size) if size else "unknown size"
+
+        self.ollama_extract_button.setEnabled(True)
+        self.ollama_extract_status.setText(
+            f"Extracted {model_name} → {dest_path} ({size_text})"
+        )
+
+        # Set the extracted model path on the selected target server slot
+        target_index = self._resolve_server_index(None)
+        self.server_slots[target_index].model_path_input.setText(dest_path)
+        self._save_config()
+        self.log_output.appendPlainText(
+            f"[OLLAMA] Extracted GGUF: {model_name} → {dest_path} ({size_text})"
+        )
+
+        QMessageBox.information(
+            self,
+            "GGUF Extracted",
+            f"Model: {model_name}\n"
+            f"Saved to: {dest_path}\n"
+            f"Size: {size_text}\n\n"
+            f"Model path has been set on Server {target_index + 1}.",
+        )
+
+    def _on_ollama_extract_error(self, message: str) -> None:
+        self.ollama_extract_button.setEnabled(True)
+        self.ollama_extract_status.setText("Extraction failed.")
+        QMessageBox.critical(self, "Extraction Failed", message)
 
     def _resolve_server_index(self, slot_index: int | None) -> int:
         if slot_index is not None and 0 <= slot_index < len(self.server_slots):
