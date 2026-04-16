@@ -18,7 +18,7 @@ from typing import Any, Callable
 from urllib.parse import urlparse
 
 import requests
-from huggingface_hub import HfApi, hf_hub_url
+from huggingface_hub import HfApi, hf_hub_url, snapshot_download
 from PySide6.QtCore import QProcess, QProcessEnvironment, QRunnable, QThreadPool, Qt, QObject, Signal
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import (
@@ -232,11 +232,7 @@ class HuggingFaceClient:
         model_weight_extensions = {".safetensors", ".bin", ".pt", ".pth"}
         has_model_weights = False
         conversion_files: list[tuple[str, int]] = []
-        config_patterns = {
-            "config.json", "tokenizer.json", "tokenizer_config.json",
-            "special_tokens_map.json", "generation_config.json",
-            "tokenizer.model", "vocab.json", "merges.txt",
-        }
+        conversion_config_exts = {".json", ".model", ".txt", ".tiktoken"}
         all_siblings = list(info.siblings or [])
 
         for sibling in all_siblings:
@@ -256,12 +252,17 @@ class HuggingFaceClient:
                 conversion_files.append((name, int(size_value)))
 
         if has_model_weights:
+            existing_names = {n for n, _ in conversion_files}
             for sibling in all_siblings:
                 name = getattr(sibling, "rfilename", "")
                 size_value = getattr(sibling, "size", None) or 0
-                base_name = Path(name).name.lower()
-                if base_name in config_patterns:
+                if name in existing_names:
+                    continue
+                ext = Path(name).suffix.lower()
+                # Include all config / tokenizer files at the repo root
+                if ext in conversion_config_exts and "/" not in name:
                     conversion_files.append((name, int(size_value)))
+                    existing_names.add(name)
 
         return (
             details,
@@ -399,6 +400,7 @@ class ConversionProgressDialog(QDialog):
     def set_phase(self, phase: str) -> None:
         self.phase_label.setText(phase)
         self._phase_start = time.monotonic()
+        self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         self.eta_label.setText("Estimating time remaining\u2026")
 
@@ -2512,53 +2514,70 @@ class MainWindow(QMainWindow):
         """Background worker: downloads HF model files then converts to GGUF."""
         cb = progress_callback or (lambda _: None)
 
-        # ── Phase 1: Download ──────────────────────────────────────────
+        # ── Phase 1: Download via snapshot_download ────────────────────
         staging_dir = MODELS_DIR / f"_converting_{repo_id.replace('/', '_')}"
         staging_dir.mkdir(parents=True, exist_ok=True)
         total_bytes = sum(size for _, size in files)
-        downloaded_total = 0
-        started = time.monotonic()
 
-        cb({"phase": "download", "status": "Starting download…", "percent": 0})
+        cb({
+            "phase": "download",
+            "status": (
+                f"Downloading {repo_id} "
+                f"(~{self._format_bytes(total_bytes)})…"
+            ),
+            "percent": -1,
+        })
 
-        for filename, _file_size in files:
-            if self._conversion_cancelled:
-                raise RuntimeError("Cancelled by user.")
+        if self._conversion_cancelled:
+            raise RuntimeError("Cancelled by user.")
 
-            url = hf_hub_url(repo_id=repo_id, filename=filename)
-            headers: dict[str, str] = {}
-            if token:
-                headers["Authorization"] = f"Bearer {token}"
+        # Ticker thread sends elapsed-time status updates while
+        # snapshot_download blocks the worker thread.
+        download_done = threading.Event()
+        download_start = time.monotonic()
 
-            dest_path = staging_dir / filename
-            dest_path.parent.mkdir(parents=True, exist_ok=True)
+        def _status_ticker() -> None:
+            while not download_done.wait(2.0):
+                elapsed = time.monotonic() - download_start
+                mins, secs = divmod(int(elapsed), 60)
+                time_str = f"{mins}m {secs:02d}s" if mins else f"{secs}s"
+                cb({
+                    "phase": "download",
+                    "status": (
+                        f"Downloading {repo_id} "
+                        f"(~{self._format_bytes(total_bytes)}) — "
+                        f"{time_str} elapsed"
+                    ),
+                    "percent": -1,
+                })
 
-            with requests.get(url, headers=headers, stream=True, timeout=60) as resp:
-                resp.raise_for_status()
-                with dest_path.open("wb") as fh:
-                    for chunk in resp.iter_content(chunk_size=1024 * 1024):
-                        if self._conversion_cancelled:
-                            raise RuntimeError("Cancelled by user.")
-                        if not chunk:
-                            continue
-                        fh.write(chunk)
-                        downloaded_total += len(chunk)
+        ticker = threading.Thread(target=_status_ticker, daemon=True)
+        ticker.start()
 
-                        pct = min(99, int(downloaded_total * 100 / total_bytes)) if total_bytes else 0
-                        elapsed = max(time.monotonic() - started, 0.001)
-                        speed = downloaded_total / elapsed
-                        eta = (total_bytes - downloaded_total) / speed if speed > 0 else 0
-                        cb({
-                            "phase": "download",
-                            "status": (
-                                f"Downloading {Path(filename).name}  —  "
-                                f"{self._format_bytes(downloaded_total)} / "
-                                f"{self._format_bytes(total_bytes)}  at "
-                                f"{self._format_bytes(speed)}/s"
-                            ),
-                            "percent": pct,
-                            "eta": eta,
-                        })
+        try:
+            snapshot_download(
+                repo_id=repo_id,
+                allow_patterns=[
+                    "*.safetensors", "*.bin", "*.pt", "*.pth",
+                    "*.json", "*.model", "*.txt", "*.tiktoken",
+                ],
+                ignore_patterns=[
+                    "*.md", "*.gitattributes", "*.msgpack",
+                    "optimizer*", "training_args*", "scheduler*",
+                    "onnx/*", "flax_model*", "tf_model*",
+                    "coreml/*", "*.ot",
+                ],
+                token=token or None,
+                local_dir=str(staging_dir),
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Download failed: {exc}") from exc
+        finally:
+            download_done.set()
+            ticker.join(timeout=5)
+
+        if self._conversion_cancelled:
+            raise RuntimeError("Cancelled by user.")
 
         cb({"phase": "download", "status": "Download complete.", "percent": 100})
 
@@ -2663,7 +2682,16 @@ class MainWindow(QMainWindow):
             elif phase == "convert":
                 dialog.set_phase("Phase 2/2 — Converting to GGUF")
 
-        if percent >= 0:
+        if percent == -1:
+            # Indeterminate / pulsing progress bar (used during snapshot_download)
+            if dialog.progress_bar.maximum() != 0:
+                dialog.progress_bar.setRange(0, 0)
+            if status:
+                dialog.set_status(status)
+            dialog.eta_label.setText("")
+        elif percent >= 0:
+            if dialog.progress_bar.maximum() == 0:
+                dialog.progress_bar.setRange(0, 100)
             dialog.set_progress(percent, status)
         elif status:
             dialog.set_status(status)
