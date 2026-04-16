@@ -1326,6 +1326,10 @@ class MainWindow(QMainWindow):
         )
         form.addRow("Flash Attention", flash_attn_checkbox)
 
+        no_cache_prompt_checkbox = QCheckBox("Disable prompt caching")
+        no_cache_prompt_checkbox.setToolTip("Pass --no-cache-prompt to llama-server.")
+        form.addRow("No Cache Prompt", no_cache_prompt_checkbox)
+
         network_layout = QGridLayout()
         host_input = QLineEdit("127.0.0.1")
         port_input = QSpinBox()
