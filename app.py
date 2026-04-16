@@ -2931,32 +2931,34 @@ class MainWindow(QMainWindow):
                 f"ollama show failed:\n{result.stderr.strip() or result.stdout.strip()}"
             )
 
-        # Parse the FROM line to get the blob hash
+        # Parse the FROM line to get either a direct blob path or a blob hash
         blob_hash = None
+        blob_path: Path | None = None
         for line in result.stdout.splitlines():
             line = line.strip()
             if line.upper().startswith("FROM"):
-                value = line.split(None, 1)[-1].strip()
-                # Value is something like  /path/to/blob  or  sha256:abc123...
-                if "sha256" in value.lower():
-                    # Extract just the hash part
-                    blob_hash = value.replace(":", "-")
-                    break
-                elif Path(value).exists():
-                    # Direct path to the blob file
-                    blob_hash = value
+                value = line.split(None, 1)[-1].strip().strip('"')
+                candidate_path = Path(value)
+
+                # Value may already be a full blob path, e.g.
+                # C:\Users\...\.ollama\models\blobs\sha256-...
+                if candidate_path.is_absolute() or candidate_path.exists():
+                    blob_path = candidate_path
                     break
 
-        if not blob_hash:
+                # Otherwise it may be a blob reference like sha256:abc123...
+                if value.lower().startswith("sha256:") or value.lower().startswith("sha256-"):
+                    blob_hash = value.replace(":", "-")
+                    break
+
+        if not blob_hash and blob_path is None:
             raise RuntimeError(
                 f"Could not find a FROM sha256:… line in modelfile for '{model_name}'.\n\n"
                 f"Output:\n{result.stdout[:500]}"
             )
 
         # Locate the actual blob file
-        if Path(blob_hash).exists():
-            blob_path = Path(blob_hash)
-        else:
+        if blob_path is None:
             blob_path = OLLAMA_BLOBS_DIR / blob_hash
             if not blob_path.exists():
                 # Try with sha256- prefix format
