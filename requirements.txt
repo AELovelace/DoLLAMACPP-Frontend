@@ -4,7 +4,8 @@ requests>=2.31
 
 # Optional: required for "Download & Convert to GGUF" feature
 # These will be auto-installed on first use if missing.
-# gguf>=0.6
+# gguf — installed from llama.cpp git repo at conversion time to stay in sync
+# with convert_hf_to_gguf.py (the PyPI release often lags behind).
 # numpy>=1.24
 # torch>=2.0
 # safetensors>=0.4
