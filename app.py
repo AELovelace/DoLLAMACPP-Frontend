@@ -770,6 +770,8 @@ class ServerSlot:
     stop_button: QPushButton
     status_label: QLabel
     proxy_status_label: QLabel
+    prompt_active: bool = False
+    prompt_tokens_generated: int = 0
 
 
 class WorkerSignals(QObject):
@@ -1150,8 +1152,14 @@ class OllamaCompatProxy:
     def __init__(
         self,
         get_snapshot: Callable[[], dict[str, Any]],
+        on_request_start: Callable[[int], None] | None = None,
+        on_request_progress: Callable[[int, int, int], None] | None = None,
+        on_request_end: Callable[[int], None] | None = None,
     ) -> None:
         self._get_snapshot = get_snapshot
+        self._on_request_start = on_request_start
+        self._on_request_progress = on_request_progress
+        self._on_request_end = on_request_end
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
@@ -1190,6 +1198,20 @@ class OllamaCompatProxy:
                     payload = parent._build_tags_payload()
                     self._send_json(200, payload)
                     return
+                if parsed.path == "/v1/models":
+                    # OpenAI-compatible models endpoint
+                    payload = parent._build_tags_payload()
+                    # Convert to OpenAI format
+                    models = []
+                    for model in payload.get("models", []):
+                        models.append({
+                            "id": model.get("name"),
+                            "object": "model",
+                            "created": int(time.time()),
+                            "owned_by": "local",
+                        })
+                    self._send_json(200, {"object": "list", "data": models})
+                    return
                 self._send_json(404, {"error": f"Unsupported endpoint: {parsed.path}"})
 
             def do_POST(self) -> None:  # noqa: N802
@@ -1202,6 +1224,14 @@ class OllamaCompatProxy:
                     return
                 if parsed.path == "/api/chat":
                     parent._handle_chat(self)
+                    return
+                if parsed.path == "/v1/chat/completions":
+                    # OpenAI-compatible chat completions endpoint
+                    parent._handle_v1_chat_completions(self)
+                    return
+                if parsed.path == "/v1/completions":
+                    # OpenAI-compatible completions endpoint
+                    parent._handle_v1_completions(self)
                     return
                 self._send_json(404, {"error": f"Unsupported endpoint: {parsed.path}"})
 
@@ -1276,6 +1306,50 @@ class OllamaCompatProxy:
     def _send_error(self, handler: BaseHTTPRequestHandler, message: str, status_code: int = 400) -> None:
         handler._send_json(status_code, {"error": message})  # type: ignore[attr-defined]
 
+    def _send_openai_sse(self, handler: BaseHTTPRequestHandler, payloads: list[dict[str, Any]]) -> None:
+        body = b""
+        for payload in payloads:
+            body += f"data: {json.dumps(payload)}\\n\\n".encode("utf-8")
+        body += b"data: [DONE]\\n\\n"
+        handler.send_response(200)
+        handler.send_header("Content-Type", "text/event-stream")
+        handler.send_header("Cache-Control", "no-cache")
+        handler.send_header("Connection", "keep-alive")
+        handler.send_header("Content-Length", str(len(body)))
+        handler.end_headers()
+        handler.wfile.write(body)
+
+    def _notify_request_start(self, server_index: int) -> None:
+        if self._on_request_start is None:
+            return
+        try:
+            self._on_request_start(server_index)
+        except Exception:
+            pass
+
+    def _notify_request_end(self, server_index: int) -> None:
+        if self._on_request_end is None:
+            return
+        try:
+            self._on_request_end(server_index)
+        except Exception:
+            pass
+
+    def _notify_request_progress(self, server_index: int, percent: int, tokens: int) -> None:
+        if self._on_request_progress is None:
+            return
+        try:
+            self._on_request_progress(server_index, percent, tokens)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _estimate_percent(tokens: int, max_tokens: int) -> int:
+        if max_tokens > 0:
+            return max(1, min(99, int(tokens * 100 / max_tokens)))
+        # Unknown max tokens: use a smooth estimate curve that rises quickly then tapers.
+        return max(1, min(95, int((tokens / (tokens + 40.0)) * 100.0)))
+
     def _resolve_slot(self, payload: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
         snapshot = self._get_snapshot()
         slots = list(snapshot.get("slots", []))
@@ -1324,6 +1398,44 @@ class OllamaCompatProxy:
             return ""
         text = choices[0].get("text", "")
         return str(text).strip()
+
+    @staticmethod
+    def _split_reasoning_from_text(text: str) -> tuple[str, str]:
+        raw = str(text or "")
+        if not raw:
+            return "", ""
+
+        think_pattern = re.compile(r"<think>(.*?)</think>", re.IGNORECASE | re.DOTALL)
+        reasoning_parts = [part.strip() for part in think_pattern.findall(raw) if part and part.strip()]
+        visible = think_pattern.sub("", raw).strip()
+        reasoning = "\n\n".join(reasoning_parts).strip()
+
+        # Compatibility fallback: if the model only emitted reasoning, expose that as content too.
+        if not visible and reasoning:
+            visible = reasoning
+
+        return visible, reasoning
+
+    @staticmethod
+    def _extract_stream_chat_pieces(choice: dict[str, Any]) -> tuple[str, str]:
+        delta = choice.get("delta", {}) if isinstance(choice.get("delta", {}), dict) else {}
+        message = choice.get("message", {}) if isinstance(choice.get("message", {}), dict) else {}
+
+        content_piece = str(delta.get("content", "") or message.get("content", "") or "")
+        reasoning_piece = str(
+            delta.get("reasoning_content", "")
+            or message.get("reasoning_content", "")
+            or delta.get("thinking", "")
+            or message.get("thinking", "")
+            or ""
+        )
+        return content_piece, reasoning_piece
+
+    @staticmethod
+    def _extract_stream_completion_pieces(choice: dict[str, Any]) -> tuple[str, str]:
+        text_piece = str(choice.get("text", "") or "")
+        reasoning_piece = str(choice.get("reasoning_content", "") or choice.get("thinking", "") or "")
+        return text_piece, reasoning_piece
 
     @staticmethod
     def _messages_to_prompt(messages: list[dict[str, str]]) -> str:
@@ -1376,7 +1488,8 @@ class OllamaCompatProxy:
         messages: list[dict[str, str]],
         temperature: float,
         max_tokens: int,
-    ) -> str:
+        server_index: int | None = None,
+    ) -> tuple[str, str]:
         upstream_host = normalize_connect_host(str(slot.get("host", "127.0.0.1") or "127.0.0.1"))
         base_url = f"http://{upstream_host}:{int(slot.get('port', 8080))}"
         chat_payload = {
@@ -1384,21 +1497,65 @@ class OllamaCompatProxy:
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
-            "stream": False,
+            "stream": True,
         }
 
         chat_text: str | None = None
+        chat_reasoning: str = ""
         for attempt in range(3):
             try:
                 response = requests.post(
                     f"{base_url.rstrip('/')}/v1/chat/completions",
                     json=chat_payload,
+                    stream=True,
                     timeout=300,
                 )
                 response.raise_for_status()
-                chat_text = self._extract_text_from_chat_choice(response.json())
-                if chat_text:
-                    return chat_text
+                answer_parts: list[str] = []
+                reasoning_parts: list[str] = []
+                token_count = 0
+                for raw_line in response.iter_lines(decode_unicode=True):
+                    if not raw_line:
+                        continue
+                    line = raw_line.strip()
+                    if line.startswith("data:"):
+                        line = line[5:].strip()
+                    if not line or line == "[DONE]":
+                        continue
+                    try:
+                        chunk = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    choices = chunk.get("choices", [])
+                    if not choices:
+                        continue
+                    first = choices[0] if isinstance(choices[0], dict) else {}
+                    content_piece, reasoning_piece = self._extract_stream_chat_pieces(first)
+
+                    if content_piece:
+                        answer_parts.append(content_piece)
+                    if reasoning_piece:
+                        reasoning_parts.append(reasoning_piece)
+
+                    if content_piece or reasoning_piece:
+                        token_count += 1
+                        if server_index is not None:
+                            percent = self._estimate_percent(token_count, max_tokens)
+                            self._notify_request_progress(server_index, percent, token_count)
+
+                chat_raw = "".join(answer_parts).strip()
+                reasoning_raw = "".join(reasoning_parts).strip()
+                if not reasoning_raw:
+                    visible, reasoning = self._split_reasoning_from_text(chat_raw)
+                else:
+                    visible, reasoning_from_content = self._split_reasoning_from_text(chat_raw)
+                    reasoning = (reasoning_raw + ("\n\n" + reasoning_from_content if reasoning_from_content else "")).strip()
+
+                chat_text = visible
+                chat_reasoning = reasoning
+                if chat_text or chat_reasoning:
+                    return chat_text, chat_reasoning
                 # Got 200 but empty content — log and fall through to completions
                 break
             except requests.HTTPError as exc:
@@ -1424,14 +1581,52 @@ class OllamaCompatProxy:
                 "prompt": prompt,
                 "temperature": temperature,
                 "max_tokens": max_tokens,
-                "stream": False,
+                "stream": True,
             },
+            stream=True,
             timeout=300,
         )
         completion_response.raise_for_status()
-        text = self._extract_text_from_completion(completion_response.json())
-        if text:
-            return text
+        completion_parts: list[str] = []
+        completion_reasoning_parts: list[str] = []
+        token_count = 0
+        for raw_line in completion_response.iter_lines(decode_unicode=True):
+            if not raw_line:
+                continue
+            line = raw_line.strip()
+            if line.startswith("data:"):
+                line = line[5:].strip()
+            if not line or line == "[DONE]":
+                continue
+            try:
+                chunk = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            choices = chunk.get("choices", [])
+            if not choices:
+                continue
+            first = choices[0] if isinstance(choices[0], dict) else {}
+            text_part, reasoning_part = self._extract_stream_completion_pieces(first)
+            if text_part:
+                completion_parts.append(text_part)
+            if reasoning_part:
+                completion_reasoning_parts.append(reasoning_part)
+            if text_part or reasoning_part:
+                token_count += 1
+                if server_index is not None:
+                    percent = self._estimate_percent(token_count, max_tokens)
+                    self._notify_request_progress(server_index, percent, token_count)
+
+        text_raw = "".join(completion_parts).strip()
+        reasoning_raw = "".join(completion_reasoning_parts).strip()
+        if not reasoning_raw:
+            text, reasoning = self._split_reasoning_from_text(text_raw)
+        else:
+            text, reasoning_from_text = self._split_reasoning_from_text(text_raw)
+            reasoning = (reasoning_raw + ("\n\n" + reasoning_from_text if reasoning_from_text else "")).strip()
+        if text or reasoning:
+            return text, reasoning
 
         # Both endpoints returned empty — surface as a visible error
         raise RuntimeError(
@@ -1446,7 +1641,8 @@ class OllamaCompatProxy:
         prompt: str,
         temperature: float,
         max_tokens: int,
-    ) -> str:
+        server_index: int | None = None,
+    ) -> tuple[str, str]:
         upstream_host = normalize_connect_host(str(slot.get("host", "127.0.0.1") or "127.0.0.1"))
         base_url = f"http://{upstream_host}:{int(slot.get('port', 8080))}"
         response = requests.post(
@@ -1456,14 +1652,52 @@ class OllamaCompatProxy:
                 "prompt": prompt,
                 "temperature": temperature,
                 "max_tokens": max_tokens,
-                "stream": False,
+                "stream": True,
             },
+            stream=True,
             timeout=300,
         )
         response.raise_for_status()
-        text = self._extract_text_from_completion(response.json())
-        if text:
-            return text
+        completion_parts: list[str] = []
+        completion_reasoning_parts: list[str] = []
+        token_count = 0
+        for raw_line in response.iter_lines(decode_unicode=True):
+            if not raw_line:
+                continue
+            line = raw_line.strip()
+            if line.startswith("data:"):
+                line = line[5:].strip()
+            if not line or line == "[DONE]":
+                continue
+            try:
+                chunk = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            choices = chunk.get("choices", [])
+            if not choices:
+                continue
+            first = choices[0] if isinstance(choices[0], dict) else {}
+            text_part, reasoning_part = self._extract_stream_completion_pieces(first)
+            if text_part:
+                completion_parts.append(text_part)
+            if reasoning_part:
+                completion_reasoning_parts.append(reasoning_part)
+            if text_part or reasoning_part:
+                token_count += 1
+                if server_index is not None:
+                    percent = self._estimate_percent(token_count, max_tokens)
+                    self._notify_request_progress(server_index, percent, token_count)
+
+        text_raw = "".join(completion_parts).strip()
+        reasoning_raw = "".join(completion_reasoning_parts).strip()
+        if not reasoning_raw:
+            text, reasoning = self._split_reasoning_from_text(text_raw)
+        else:
+            text, reasoning_from_text = self._split_reasoning_from_text(text_raw)
+            reasoning = (reasoning_raw + ("\n\n" + reasoning_from_text if reasoning_from_text else "")).strip()
+        if text or reasoning:
+            return text, reasoning
 
         chat_response = requests.post(
             f"{base_url.rstrip('/')}/v1/chat/completions",
@@ -1472,12 +1706,51 @@ class OllamaCompatProxy:
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": temperature,
                 "max_tokens": max_tokens,
-                "stream": False,
+                "stream": True,
             },
+            stream=True,
             timeout=300,
         )
         chat_response.raise_for_status()
-        return self._extract_text_from_chat_choice(chat_response.json())
+        chat_parts: list[str] = []
+        chat_reasoning_parts: list[str] = []
+        token_count = 0
+        for raw_line in chat_response.iter_lines(decode_unicode=True):
+            if not raw_line:
+                continue
+            line = raw_line.strip()
+            if line.startswith("data:"):
+                line = line[5:].strip()
+            if not line or line == "[DONE]":
+                continue
+            try:
+                chunk = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            choices = chunk.get("choices", [])
+            if not choices:
+                continue
+            first = choices[0] if isinstance(choices[0], dict) else {}
+            content, reasoning_part = self._extract_stream_chat_pieces(first)
+            if content:
+                chat_parts.append(content)
+            if reasoning_part:
+                chat_reasoning_parts.append(reasoning_part)
+            if content or reasoning_part:
+                token_count += 1
+                if server_index is not None:
+                    percent = self._estimate_percent(token_count, max_tokens)
+                    self._notify_request_progress(server_index, percent, token_count)
+
+        chat_raw = "".join(chat_parts).strip()
+        reasoning_raw = "".join(chat_reasoning_parts).strip()
+        if not reasoning_raw:
+            visible, reasoning = self._split_reasoning_from_text(chat_raw)
+        else:
+            visible, reasoning_from_content = self._split_reasoning_from_text(chat_raw)
+            reasoning = (reasoning_raw + ("\n\n" + reasoning_from_content if reasoning_from_content else "")).strip()
+        return visible, reasoning
 
     def _handle_generate(self, handler: BaseHTTPRequestHandler) -> None:
         started = time.time()
@@ -1506,11 +1779,15 @@ class OllamaCompatProxy:
         num_predict_val = options.get("num_predict", payload.get("num_predict", None))
         max_tokens = int(num_predict_val) if num_predict_val is not None else default_num_predict
 
+        server_index = int(slot.get("index", 0) or 0)
+        self._notify_request_start(server_index)
         try:
-            text = self._forward_completion(slot, prompt, temperature, max_tokens)
+            text, reasoning = self._forward_completion(slot, prompt, temperature, max_tokens, server_index=server_index)
         except requests.RequestException as exc:
             self._send_error(handler, f"Upstream llama-server request failed: {exc}", 502)
             return
+        finally:
+            self._notify_request_end(server_index)
 
         stream = bool(payload.get("stream", False))
         created_at = datetime.utcnow().isoformat() + "Z"
@@ -1519,6 +1796,7 @@ class OllamaCompatProxy:
             "model": model_name or "",
             "created_at": created_at,
             "response": text,
+            "reasoning_content": reasoning,
             "done": True,
             "done_reason": "stop",
             "total_duration": total_duration,
@@ -1579,11 +1857,15 @@ class OllamaCompatProxy:
         num_predict_val = options.get("num_predict", payload.get("num_predict", None))
         max_tokens = int(num_predict_val) if num_predict_val is not None else default_num_predict
 
+        server_index = int(slot.get("index", 0) or 0)
+        self._notify_request_start(server_index)
         try:
-            text = self._forward_chat(slot, messages, temperature, max_tokens)
+            text, reasoning = self._forward_chat(slot, messages, temperature, max_tokens, server_index=server_index)
         except requests.RequestException as exc:
             self._send_error(handler, f"Upstream llama-server request failed: {exc}", 502)
             return
+        finally:
+            self._notify_request_end(server_index)
 
         stream = bool(payload.get("stream", False))
         created_at = datetime.utcnow().isoformat() + "Z"
@@ -1591,7 +1873,7 @@ class OllamaCompatProxy:
         response_chunk = {
             "model": model_name or "",
             "created_at": created_at,
-            "message": {"role": "assistant", "content": text},
+            "message": {"role": "assistant", "content": text, "reasoning_content": reasoning},
             "done": True,
             "done_reason": "stop",
             "total_duration": total_duration,
@@ -1605,6 +1887,195 @@ class OllamaCompatProxy:
         if stream:
             handler._send_ndjson(200, [response_chunk])  # type: ignore[attr-defined]
             return
+        handler._send_json(200, response_chunk)  # type: ignore[attr-defined]
+
+    def _handle_v1_chat_completions(self, handler: BaseHTTPRequestHandler) -> None:
+        """OpenAI-compatible /v1/chat/completions endpoint."""
+        started = time.time()
+        try:
+            payload = self._read_json(handler)
+        except RuntimeError as exc:
+            self._send_error(handler, str(exc), 400)
+            return
+
+        slot, model_name = self._resolve_slot(payload)
+        if slot is None:
+            self._send_error(handler, "No server slots are configured.", 400)
+            return
+
+        raw_messages = payload.get("messages", [])
+        if not isinstance(raw_messages, list):
+            self._send_error(handler, "'messages' must be a list.", 400)
+            return
+
+        messages: list[dict[str, str]] = []
+        for item in raw_messages:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role", "user") or "user")
+            content = item.get("content", "")
+            if isinstance(content, list):
+                content_text = "\n".join(
+                    str(part.get("text", "")) for part in content if isinstance(part, dict)
+                ).strip()
+            else:
+                content_text = str(content or "")
+            messages.append({"role": role, "content": content_text})
+
+        if not messages:
+            self._send_error(handler, "No valid messages provided.", 400)
+            return
+
+        temperature = float(payload.get("temperature", 0.7) or 0.7)
+        max_tokens = int(payload.get("max_tokens", payload.get("max_completion_tokens", -1)) or -1)
+        stream = bool(payload.get("stream", False))
+
+        server_index = int(slot.get("index", 0) or 0)
+        self._notify_request_start(server_index)
+        try:
+            text, reasoning = self._forward_chat(slot, messages, temperature, max_tokens, server_index=server_index)
+        except requests.RequestException as exc:
+            self._send_error(handler, f"Upstream llama-server request failed: {exc}", 502)
+            return
+        finally:
+            self._notify_request_end(server_index)
+
+        created_at = datetime.utcnow().isoformat() + "Z"
+        response_id = f"chatcmpl-{int(time.time() * 1000)}"
+
+        if stream:
+            delta_payload: dict[str, Any] = {}
+            if reasoning:
+                delta_payload["reasoning_content"] = reasoning
+            if text:
+                delta_payload["content"] = text
+
+            chunks = [
+                {
+                    "id": response_id,
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": model_name or "local-model",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": delta_payload,
+                            "finish_reason": None,
+                        }
+                    ],
+                },
+                {
+                    "id": response_id,
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": model_name or "local-model",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                },
+            ]
+            self._send_openai_sse(handler, chunks)
+            return
+
+        response_chunk = {
+            "id": response_id,
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model_name or "local-model",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": text, "reasoning_content": reasoning},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+            },
+        }
+        handler._send_json(200, response_chunk)  # type: ignore[attr-defined]
+
+    def _handle_v1_completions(self, handler: BaseHTTPRequestHandler) -> None:
+        """OpenAI-compatible /v1/completions endpoint."""
+        started = time.time()
+        try:
+            payload = self._read_json(handler)
+        except RuntimeError as exc:
+            self._send_error(handler, str(exc), 400)
+            return
+
+        slot, model_name = self._resolve_slot(payload)
+        if slot is None:
+            self._send_error(handler, "No server slots are configured.", 400)
+            return
+
+        prompt = str(payload.get("prompt", "") or "")
+        if not prompt:
+            self._send_error(handler, "Missing 'prompt'.", 400)
+            return
+
+        temperature = float(payload.get("temperature", 0.7) or 0.7)
+        max_tokens = int(payload.get("max_tokens", payload.get("max_completion_tokens", -1)) or -1)
+        stream = bool(payload.get("stream", False))
+
+        server_index = int(slot.get("index", 0) or 0)
+        self._notify_request_start(server_index)
+        try:
+            text, reasoning = self._forward_completion(slot, prompt, temperature, max_tokens, server_index=server_index)
+        except requests.RequestException as exc:
+            self._send_error(handler, f"Upstream llama-server request failed: {exc}", 502)
+            return
+        finally:
+            self._notify_request_end(server_index)
+
+        created_at = datetime.utcnow().isoformat() + "Z"
+        response_id = f"cmpl-{int(time.time() * 1000)}"
+
+        if stream:
+            chunks = [
+                {
+                    "id": response_id,
+                    "object": "text_completion",
+                    "created": int(time.time()),
+                    "model": model_name or "local-model",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "text": text,
+                            "reasoning_content": reasoning,
+                            "finish_reason": "stop",
+                        }
+                    ],
+                }
+            ]
+            self._send_openai_sse(handler, chunks)
+            return
+
+        response_chunk = {
+            "id": response_id,
+            "object": "text_completion",
+            "created": int(time.time()),
+            "model": model_name or "local-model",
+            "choices": [
+                {
+                    "index": 0,
+                    "text": text,
+                    "reasoning_content": reasoning,
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+            },
+        }
         handler._send_json(200, response_chunk)  # type: ignore[attr-defined]
 
 
@@ -1638,16 +2109,24 @@ class MainWindow(QMainWindow):
         self.sakura_timer.setInterval(1000)
         self.sakura_timer.timeout.connect(self._refresh_sakura_panel)
         self.sakura_gpu_cards: list[SakuraGPUCard] = []
+        self._active_prompt_requests = 0
+        self._prompt_started_at: float | None = None
         self._snapshot_lock = threading.Lock()
         self._ollama_snapshot: dict[str, Any] = {
             "default_server": 0,
             "proxy_num_predict": -1,
             "slots": [],
         }
-        self.ollama_proxies: list[OllamaCompatProxy] = [
-            OllamaCompatProxy(lambda i=i: self._get_slot_snapshot(i))
-            for i in range(4)
-        ]
+        self.prompt_activity_signal = WorkerSignals()
+        self.prompt_activity_signal.progress.connect(self._handle_proxy_prompt_event)
+        self.ollama_proxy = OllamaCompatProxy(
+            self._get_ollama_snapshot,
+            on_request_start=lambda i: self.prompt_activity_signal.progress.emit({"event": "start", "server_index": i}),
+            on_request_progress=lambda i, p, t: self.prompt_activity_signal.progress.emit(
+                {"event": "progress", "server_index": i, "percent": p, "tokens": t}
+            ),
+            on_request_end=lambda i: self.prompt_activity_signal.progress.emit({"event": "end", "server_index": i}),
+        )
 
         self._build_ui()
         self._apply_theme()
@@ -1833,6 +2312,34 @@ class MainWindow(QMainWindow):
                 border: 1px solid #DDB2C1;
                 border-radius: 7px;
                 background: #FFEAF1;
+            }}
+
+            QProgressBar#PromptProgressBar {{
+                border: 1px solid rgba(255, 216, 236, 140);
+                border-radius: 7px;
+                background: rgba(255, 243, 249, 220);
+                text-align: center;
+                color: #593749;
+                font-weight: 600;
+            }}
+
+            QProgressBar#PromptProgressBar::chunk {{
+                border-radius: 6px;
+                background: qlineargradient(
+                    x1: 0, y1: 0, x2: 1, y2: 0,
+                    stop: 0 rgba(255, 170, 210, 230),
+                    stop: 1 rgba(238, 138, 188, 240)
+                );
+            }}
+
+            QLabel#ProgressLabel {{
+                color: #6A3F55;
+                font-weight: 600;
+            }}
+
+            QLabel#ProgressStatsLabel {{
+                color: #8A5061;
+                font-size: 9pt;
             }}
             """
         )
@@ -2067,7 +2574,7 @@ class MainWindow(QMainWindow):
         self.ollama_port_input.setValue(11434)
         ollama_proxy_layout.addWidget(QLabel("Host"), 0, 0)
         ollama_proxy_layout.addWidget(self.ollama_host_input, 0, 1)
-        ollama_proxy_layout.addWidget(QLabel("Base Port"), 0, 2)
+        ollama_proxy_layout.addWidget(QLabel("Port"), 0, 2)
         ollama_proxy_layout.addWidget(self.ollama_port_input, 0, 3)
         ollama_layout.addRow("Listen", self._wrap_layout(ollama_proxy_layout))
         self.ollama_host_input.textChanged.connect(self._update_proxy_port_labels)
@@ -2144,6 +2651,7 @@ class MainWindow(QMainWindow):
 
         ollama_model_input = QLineEdit(f"server-{index + 1}")
         ollama_model_input.setPlaceholderText("Ollama model alias for this server slot")
+        ollama_model_input.textChanged.connect(self._update_proxy_port_labels)
         form.addRow("Ollama Model", ollama_model_input)
 
         backend_label = QLabel("Auto")
@@ -2263,6 +2771,8 @@ class MainWindow(QMainWindow):
                 stop_button=stop_button,
                 status_label=status_label,
                 proxy_status_label=proxy_status_label,
+                prompt_active=False,
+                prompt_tokens_generated=0,
             )
         )
 
@@ -2448,6 +2958,24 @@ class MainWindow(QMainWindow):
         self.clear_log_button.clicked.connect(self.log_output.clear)
         log_layout.addWidget(self.clear_log_button)
         log_layout.addWidget(self.log_output)
+        
+        # Progress bar for prompt inference
+        self.prompt_progress_layout = QVBoxLayout()
+        self.prompt_progress_layout.setContentsMargins(0, 0, 0, 0)
+        self.prompt_progress_label = QLabel("No active requests")
+        self.prompt_progress_label.setObjectName("ProgressLabel")
+        self.prompt_progress_bar = QProgressBar()
+        self.prompt_progress_bar.setRange(0, 100)
+        self.prompt_progress_bar.setValue(0)
+        self.prompt_progress_bar.setTextVisible(True)
+        self.prompt_progress_bar.setFixedHeight(24)
+        self.prompt_progress_bar.setObjectName("PromptProgressBar")
+        self.prompt_progress_stats_label = QLabel("Idle")
+        self.prompt_progress_stats_label.setObjectName("ProgressStatsLabel")
+        self.prompt_progress_layout.addWidget(self.prompt_progress_label)
+        self.prompt_progress_layout.addWidget(self.prompt_progress_bar)
+        self.prompt_progress_layout.addWidget(self.prompt_progress_stats_label)
+        log_layout.addLayout(self.prompt_progress_layout)
 
         splitter.addWidget(sakura_box)
         splitter.addWidget(log_box)
@@ -4077,52 +4605,37 @@ class MainWindow(QMainWindow):
 
     def start_ollama_proxy(self) -> None:
         host = self.ollama_host_input.text().strip() or "127.0.0.1"
-        base_port = self.ollama_port_input.value()
+        port = self.ollama_port_input.value()
         self._refresh_ollama_snapshot()
         self._save_config()
 
-        started = 0
-        errors: list[str] = []
-        for i, proxy in enumerate(self.ollama_proxies):
-            port = base_port + i
-            try:
-                proxy.start(host, port)
-                started += 1
-                if i < len(self.server_slots):
-                    self.server_slots[i].proxy_status_label.setText(f"http://{host}:{port}")
-                self.log_output.appendPlainText(f"[OLLAMA] S{i + 1} proxy at http://{host}:{port}")
-            except Exception as exc:  # noqa: BLE001
-                errors.append(f"S{i + 1}: {exc}")
-
-        if started == 0:
-            QMessageBox.critical(self, "Ollama Proxy Failed", "\n".join(errors) or "All proxies failed to start.")
+        try:
+            self.ollama_proxy.start(host, port)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "Ollama Proxy Failed", str(exc) or "Proxy failed to start.")
             self._set_ollama_proxy_state(False, "Ollama API proxy failed to start.")
+            self._update_proxy_port_labels()
             return
 
-        status = f"Running — S1={base_port}, S2={base_port + 1}, S3={base_port + 2}, S4={base_port + 3}"
-        if errors:
-            status += f"  ({len(errors)} failed: {'; '.join(errors)})"
+        status = f"Running at http://{host}:{port} (routes by model name)"
+        self.log_output.appendPlainText(f"[OLLAMA] proxy at http://{host}:{port}")
         self._set_ollama_proxy_state(True, status)
+        self._update_proxy_port_labels()
 
     def stop_ollama_proxy(self) -> None:
-        for i, proxy in enumerate(self.ollama_proxies):
-            proxy.stop()
+        self.ollama_proxy.stop()
         self._set_ollama_proxy_state(False, "Ollama API proxy is stopped.")
-        self.log_output.appendPlainText("[OLLAMA] all proxies stopped")
+        self.log_output.appendPlainText("[OLLAMA] proxy stopped")
         self._update_proxy_port_labels()
 
     def test_ollama_proxy(self) -> None:
         host = normalize_connect_host(self.ollama_host_input.text().strip() or "127.0.0.1")
-        base_port = self.ollama_port_input.value()
+        port = self.ollama_port_input.value()
 
-        running_index = next(
-            (i for i, proxy in enumerate(self.ollama_proxies) if proxy.is_running()), None
-        )
-        if running_index is None:
+        if not self.ollama_proxy.is_running():
             self.ollama_proxy_test_status.setText("No proxy is running.")
             return
 
-        port = base_port + running_index
         base_url = f"http://{host}:{port}"
 
         self.test_ollama_proxy_button.setEnabled(False)
@@ -4156,16 +4669,16 @@ class MainWindow(QMainWindow):
         self.ollama_proxy_test_status.setText(f"Failed: {message}")
 
     def _update_proxy_port_labels(self) -> None:
-        if not hasattr(self, "server_slots") or not hasattr(self, "ollama_proxies"):
+        if not hasattr(self, "server_slots") or not hasattr(self, "ollama_proxy"):
             return
         host = self.ollama_host_input.text().strip() or "127.0.0.1"
-        base_port = self.ollama_port_input.value()
-        for i, slot in enumerate(self.server_slots):
-            proxy = self.ollama_proxies[i] if i < len(self.ollama_proxies) else None
-            if proxy and proxy.is_running():
-                slot.proxy_status_label.setText(f"http://{host}:{base_port + i}")
+        port = self.ollama_port_input.value()
+        for slot in self.server_slots:
+            model_name = slot.ollama_model_input.text().strip() or f"server-{slot.index + 1}"
+            if self.ollama_proxy.is_running():
+                slot.proxy_status_label.setText(f"http://{host}:{port} (model: {model_name})")
             else:
-                slot.proxy_status_label.setText(f"Proxy stopped (port {base_port + i})")
+                slot.proxy_status_label.setText(f"Proxy stopped (port {port}, model: {model_name})")
 
     def _auto_detect_llama_server(self, backend: str) -> str:
         backend_key = backend.strip().lower()
@@ -4425,15 +4938,21 @@ class MainWindow(QMainWindow):
         self._append_chat_message("user", prompt)
         self.chat_input.clear()
 
+        # Start progress tracking for this server
+        self._start_prompt_progress(chat_index)
+
         worker = Worker(
-            self.server_client.chat,
+            self._chat_with_progress,
+            chat_index,
             base_url,
             messages,
             self.chat_max_tokens_input.value(),
             self.temperature_input.value() / 100.0,
+            use_progress=True,
         )
         worker.signals.finished.connect(self._chat_complete)
         worker.signals.error.connect(self._chat_failed)
+        worker.signals.progress.connect(self._handle_chat_progress_event)
         self.thread_pool.start(worker)
 
     def _chat_complete(self, reply: str) -> None:
@@ -4445,6 +4964,7 @@ class MainWindow(QMainWindow):
         self.pending_user_message = ""
         self._append_chat_message("assistant", reply)
         self._save_config()
+        self._finish_prompt_progress()
 
     def _chat_failed(self, message: str) -> None:
         self.send_chat_button.setEnabled(True)
@@ -4452,6 +4972,145 @@ class MainWindow(QMainWindow):
         self.pending_user_message = ""
         self.chat_history_output.appendPlainText(f"[error]\n{message}\n")
         QMessageBox.critical(self, "Chat Failed", message)
+        self._finish_prompt_progress()
+
+    def _chat_with_progress(
+        self,
+        server_index: int,
+        base_url: str,
+        messages: list[dict[str, str]],
+        max_tokens: int,
+        temperature: float,
+        progress_callback: Callable[[dict[str, Any]], None],
+    ) -> str:
+        """Send chat request with streaming response parsing for progress updates."""
+        url = f"{base_url.rstrip('/')}/v1/chat/completions"
+        payload = {
+            "model": "local-model",
+            "messages": messages,
+            "max_tokens": max_tokens if max_tokens > 0 else 2048,
+            "temperature": temperature,
+            "stream": True,
+        }
+        
+        try:
+            response = requests.post(url, json=payload, stream=True, timeout=300)
+            response.raise_for_status()
+            
+            full_text = ""
+            token_count = 0
+            max_expected = payload.get("max_tokens", 2048)
+            
+            for line in response.iter_lines():
+                if not line:
+                    continue
+                
+                line_str = line.decode("utf-8", errors="replace") if isinstance(line, bytes) else line
+                if line_str.startswith("data: "):
+                    line_str = line_str[6:].strip()
+                
+                if not line_str or line_str == "[DONE]":
+                    continue
+                
+                try:
+                    chunk = json.loads(line_str)
+                    delta = chunk.get("choices", [{}])[0].get("delta", {})
+                    content = delta.get("content", "")
+                    if content:
+                        full_text += content
+                        token_count += 1
+                        # Update progress bar via callback
+                        if max_expected > 0:
+                            percent = min(99, int(token_count * 100 / max_expected))
+                        else:
+                            percent = min(99, token_count % 100)
+                        progress_callback(
+                            {
+                                "event": "progress",
+                                "server_index": server_index,
+                                "percent": percent,
+                                "tokens": token_count,
+                            }
+                        )
+                except json.JSONDecodeError:
+                    continue
+            
+            # Mark as complete
+            progress_callback(
+                {
+                    "event": "progress",
+                    "server_index": server_index,
+                    "percent": 100,
+                    "tokens": token_count,
+                }
+            )
+            return full_text
+        except requests.RequestException as exc:
+            raise RuntimeError(f"Chat request failed: {exc}") from exc
+
+    def _handle_chat_progress_event(self, payload: object) -> None:
+        if not isinstance(payload, dict):
+            return
+        server_index = int(payload.get("server_index", 0) or 0)
+        percent = int(payload.get("percent", 0) or 0)
+        tokens = int(payload.get("tokens", 0) or 0)
+        self._update_prompt_progress(server_index, percent, tokens)
+
+    def _handle_proxy_prompt_event(self, payload: object) -> None:
+        if not isinstance(payload, dict):
+            return
+        event = str(payload.get("event", "")).strip().lower()
+        server_index = int(payload.get("server_index", 0) or 0)
+        if event == "start":
+            self._start_prompt_progress(server_index)
+        elif event == "progress":
+            percent = int(payload.get("percent", 0) or 0)
+            tokens = int(payload.get("tokens", 0) or 0)
+            self._update_prompt_progress(server_index, percent, tokens)
+        elif event == "end":
+            self._finish_prompt_progress(server_index)
+
+    def _start_prompt_progress(self, server_index: int) -> None:
+        """Initialize progress tracking for a prompt on a specific server."""
+        slot = self.server_slots[server_index]
+        slot.prompt_active = True
+        slot.prompt_tokens_generated = 0
+        self._active_prompt_requests += 1
+        self._prompt_started_at = time.time()
+        self.prompt_progress_label.setText(f"Server {server_index + 1} responding...")
+        self.prompt_progress_bar.setRange(0, 0)
+        self.prompt_progress_bar.setFormat("Working...")
+        self.prompt_progress_stats_label.setText("Elapsed 0.0s | 0.0 tok/s")
+
+    def _update_prompt_progress(self, server_index: int, percent: int, tokens: int) -> None:
+        """Update progress bar with token count."""
+        if self._prompt_started_at is None:
+            self._prompt_started_at = time.time()
+        elapsed = max(0.001, time.time() - self._prompt_started_at)
+        tok_per_sec = tokens / elapsed
+        self.prompt_progress_bar.setRange(0, 100)
+        self.prompt_progress_bar.setValue(max(0, min(100, percent)))
+        self.prompt_progress_bar.setFormat("%p%")
+        token_text = f"{tokens} token{'s' if tokens != 1 else ''}"
+        self.prompt_progress_label.setText(f"Server {server_index + 1} generating... {token_text}")
+        self.prompt_progress_stats_label.setText(f"Elapsed {elapsed:.1f}s | {tok_per_sec:.1f} tok/s")
+
+    def _finish_prompt_progress(self, _server_index: int | None = None) -> None:
+        """Clear progress tracking."""
+        if self._active_prompt_requests > 0:
+            self._active_prompt_requests -= 1
+        if self._active_prompt_requests > 0:
+            return
+        for slot in self.server_slots:
+            slot.prompt_active = False
+            slot.prompt_tokens_generated = 0
+        self._prompt_started_at = None
+        self.prompt_progress_label.setText("No active requests")
+        self.prompt_progress_bar.setRange(0, 100)
+        self.prompt_progress_bar.setValue(0)
+        self.prompt_progress_bar.setFormat("%p%")
+        self.prompt_progress_stats_label.setText("Idle")
+
 
     def clear_chat(self) -> None:
         self.chat_history.clear()
